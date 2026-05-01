@@ -936,3 +936,16 @@ Closed plan: `docs/superpowers/plans/2026-05-01-thunder-p5p6-capacity-pause-resu
 
 **Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.2
 **Plan**: docs/superpowers/plans/2026-05-01-thunder-phase7-m2-streaming.md
+
+## D-29..D-31 (2026-05-01): Phase 7 M3 — full token calibration
+
+`<SIGNED-OFF>` Replaces hardcoded `chars / 4 + 256` with three-tier calibrated lookup. Per-program `local_char_to_token_ratio` and `local_completion_fraction` (Optional) stored on Program; global versions on RouterState. EMA update with α=0.2 mixing weight (matches Python router.py:404). Wall-time half-life decay (3600s) toward neutral values (4.0 for ratio, 0.5 for fraction).
+
+**D-29**: `estimate_request_tokens(info, state)` does three-tier lookup: per-program → global → neutral. Same tiered logic for completion fraction.
+
+**D-30**: Completion budget calibration: per-program EMA on `completion_tokens / declared_max_tokens`. Default fraction 0.5. Falls back to 256 when `declared_max_tokens` is None.
+
+**D-31**: Time-decay: `decay_weight = exp(-elapsed * ln(2) / half_life_s)`; `decayed = decay_weight * stored + (1 - decay_weight) * neutral`. Applied before EMA update so old data fades regardless of update frequency.
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.3
+**Plan**: docs/superpowers/plans/2026-05-01-thunder-phase7-m3-calibration.md

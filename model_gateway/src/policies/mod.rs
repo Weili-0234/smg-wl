@@ -70,6 +70,10 @@ pub struct UsageEvent {
     /// Anthropic-only: tokens served from prompt cache (excluded from prefill ratio in M3).
     /// `None` for OpenAI Chat / Responses where this concept doesn't exist.
     pub cache_read_input_tokens: Option<u32>,
+    /// Client-declared `max_tokens` (or equivalent: `max_completion_tokens` for
+    /// OpenAI Chat, `max_output_tokens` for Responses). Used by M3 completion
+    /// fraction calibration. `None` if the request did not specify a limit.
+    pub declared_max_tokens: Option<u32>,
 }
 
 /// Per-progress event emitted during streaming (every ~20 tokens or per Anthropic
@@ -266,6 +270,11 @@ pub struct SelectWorkerInfo<'a> {
     /// program-aware policies (Thunder) for capacity tracking. Default None
     /// keeps existing policies' behavior unchanged.
     pub program_id: Option<&'a str>,
+    /// Client-declared completion budget (`max_tokens` / `max_completion_tokens`
+    /// / `max_output_tokens` depending on protocol). Used by Thunder M3
+    /// completion-fraction calibration to estimate the completion side of
+    /// reserve. `None` for legacy clients that omit the field.
+    pub declared_max_tokens: Option<u32>,
 }
 
 #[cfg(test)]
@@ -328,6 +337,7 @@ mod tests {
             total_tokens: 150,
             request_text_chars: 400,
             cache_read_input_tokens: None,
+            declared_max_tokens: None,
         };
         assert_eq!(ev.total_tokens, 150);
         assert_eq!(ev.program_id.as_deref(), Some("p1"));
@@ -342,6 +352,7 @@ mod tests {
             headers: None,
             hash_ring: None,
             program_id: Some(pid),
+            declared_max_tokens: None,
         };
         assert_eq!(info.program_id, Some("agent-step-7"));
     }

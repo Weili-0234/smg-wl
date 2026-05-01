@@ -16,7 +16,12 @@
 //! - Pause/resume + BFD + force-timeout → P6
 //! - `ProgramRequestGuard` RAII → P6
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    f64,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use tokio::sync::{
@@ -29,6 +34,53 @@ use super::{
     thunder_metrics, LoadBalancingPolicy, SelectWorkerInfo, StreamingProgressEvent, UsageEvent,
 };
 use crate::worker::Worker;
+
+/// Neutral fallback for chars-per-token ratio when no calibration data is
+/// available. Matches the SMG MVP's hardcoded `chars / 4` baseline.
+const NEUTRAL_RATIO: f64 = 4.0;
+/// Neutral fallback for completion-fraction (actual_completion / max_tokens).
+/// 0.5 = "expect about half of the declared budget on average" — a saner
+/// guess than 0 (always under-reserve) or 1.0 (always over-reserve).
+const NEUTRAL_FRACTION: f64 = 0.5;
+/// EMA mixing weight for new observations. Match Python's `0.2` (router.py:404).
+const EMA_ALPHA: f64 = 0.2;
+/// Wall-time half-life for calibration decay back toward neutral (M3 D-31).
+const CALIBRATION_HALF_LIFE: Duration = Duration::from_secs(3600);
+/// Fallback completion budget when no `declared_max_tokens` is present in the
+/// request (e.g., legacy clients omitting `max_tokens`).
+const FALLBACK_COMPLETION_TOKENS: u64 = 256;
+
+/// Decay-weighted EMA update for a calibration value. Decays the previously
+/// stored value toward `neutral` based on wall-time elapsed since `last_at`,
+/// then mixes in `observed` at weight `EMA_ALPHA`.
+///
+/// First-observation special case: directly assigns `observed` (matches
+/// Python `router.py:399` "first request → directly assign").
+pub(crate) fn update_calibration_with_decay(
+    stored: &mut Option<f64>,
+    last_at: &mut Option<Instant>,
+    observed: f64,
+    neutral: f64,
+    now: Instant,
+) {
+    let decayed = match (*stored, *last_at) {
+        (Some(prev), Some(t_old)) => {
+            let elapsed = now.saturating_duration_since(t_old).as_secs_f64();
+            let half_life_s = CALIBRATION_HALF_LIFE.as_secs_f64();
+            let retain = (-elapsed * f64::consts::LN_2 / half_life_s).exp();
+            retain * prev + (1.0 - retain) * neutral
+        }
+        _ => neutral,
+    };
+
+    let new_value = match *stored {
+        None => observed,
+        Some(_) => EMA_ALPHA * observed + (1.0 - EMA_ALPHA) * decayed,
+    };
+
+    *stored = Some(new_value);
+    *last_at = Some(now);
+}
 
 /// Sub-mode selector. Phase 3 only implements `Default`. `Tr` (transactional)
 /// arrives in Phase 5 with capacity-gated admission; until then Tr falls back
@@ -85,6 +137,15 @@ pub struct Program {
     /// `UsageEvent` arrives so capacity accounting stays consistent across
     /// the request lifetime.
     pub estimated_reserved_tokens: u64,
+    /// Per-program `chars / actual_prefill_tokens` ratio (M3). `None` until
+    /// first UsageEvent arrives. Falls back to `RouterState.global_*` then
+    /// to `NEUTRAL_RATIO`.
+    pub local_char_to_token_ratio: Option<f64>,
+    /// Per-program `actual_completion_tokens / declared_max_tokens` (M3).
+    /// `None` until first event with declared_max_tokens > 0 arrives.
+    pub local_completion_fraction: Option<f64>,
+    /// Last calibration timestamp (M3 wall-time decay).
+    pub last_calibration_at: Option<Instant>,
 }
 
 impl Program {
@@ -96,6 +157,9 @@ impl Program {
             total_tokens: 0,
             step_count: 0,
             estimated_reserved_tokens: 0,
+            local_char_to_token_ratio: None,
+            local_completion_fraction: None,
+            last_calibration_at: None,
         }
     }
 }
@@ -136,6 +200,14 @@ pub struct RouterState {
     /// race where a freshly-arriving second request mis-pairs with a
     /// just-deleted handle. Re-cleanup deferred to P9 if it ever matters.
     pub waiting_events: HashMap<String, Arc<Notify>>,
+    /// Global chars/token ratio (M3 calibration; tier 2 fallback after
+    /// per-program). Updated by `usage_consumer_task` on every UsageEvent
+    /// with `prompt_tokens > 0`.
+    pub global_char_to_token_ratio: Option<f64>,
+    /// Global completion fraction (`actual_completion / declared_max_tokens`).
+    pub global_completion_fraction: Option<f64>,
+    /// Last global calibration timestamp (M3 wall-time decay).
+    pub last_global_calibration_at: Option<Instant>,
 }
 
 impl RouterState {
@@ -353,11 +425,76 @@ impl ThunderPolicy {
                         .active_program_tokens
                         .saturating_add(u64::from(event.total_tokens));
                 }
+                let now = Instant::now();
+                // M3 calibration update: chars/token ratio (per-program + global)
+                // and completion fraction (per-program + global). Excludes cached
+                // prefill from the prefill ratio (Anthropic prompt caching, M8).
+                let actual_prefill = u64::from(event.prompt_tokens).saturating_sub(
+                    event.cache_read_input_tokens.map(u64::from).unwrap_or(0),
+                );
+                let observed_ratio = if event.request_text_chars > 0 && actual_prefill > 0 {
+                    Some(event.request_text_chars as f64 / actual_prefill as f64)
+                } else {
+                    None
+                };
+                let observed_fraction = match event.declared_max_tokens {
+                    Some(mt) if mt > 0 && event.completion_tokens > 0 => Some(
+                        (f64::from(event.completion_tokens) / f64::from(mt)).clamp(0.0, 1.0),
+                    ),
+                    _ => None,
+                };
+
                 if let Some(p) = guard.programs.get_mut(&pid) {
                     p.total_tokens = p.total_tokens.saturating_add(u64::from(event.total_tokens));
                     p.estimated_reserved_tokens = 0;
                     if p.in_flight > 0 {
                         p.in_flight -= 1;
+                    }
+                    if let Some(observed) = observed_ratio {
+                        update_calibration_with_decay(
+                            &mut p.local_char_to_token_ratio,
+                            &mut p.last_calibration_at,
+                            observed,
+                            NEUTRAL_RATIO,
+                            now,
+                        );
+                    }
+                    if let Some(observed) = observed_fraction {
+                        update_calibration_with_decay(
+                            &mut p.local_completion_fraction,
+                            &mut p.last_calibration_at,
+                            observed,
+                            NEUTRAL_FRACTION,
+                            now,
+                        );
+                    }
+                }
+                // Global ratios — split disjoint field borrows so the helper
+                // can take two `&mut` simultaneously without aliasing.
+                {
+                    let RouterState {
+                        global_char_to_token_ratio,
+                        global_completion_fraction,
+                        last_global_calibration_at,
+                        ..
+                    } = &mut *guard;
+                    if let Some(observed) = observed_ratio {
+                        update_calibration_with_decay(
+                            global_char_to_token_ratio,
+                            last_global_calibration_at,
+                            observed,
+                            NEUTRAL_RATIO,
+                            now,
+                        );
+                    }
+                    if let Some(observed) = observed_fraction {
+                        update_calibration_with_decay(
+                            global_completion_fraction,
+                            last_global_calibration_at,
+                            observed,
+                            NEUTRAL_FRACTION,
+                            now,
+                        );
                     }
                 }
 
@@ -449,6 +586,9 @@ impl ThunderPolicy {
             // shouldn't usually inspect Notify identity but cloning keeps
             // the type symmetric.
             waiting_events: guard.waiting_events.clone(),
+            global_char_to_token_ratio: guard.global_char_to_token_ratio,
+            global_completion_fraction: guard.global_completion_fraction,
+            last_global_calibration_at: guard.last_global_calibration_at,
         }
     }
 }
@@ -705,16 +845,20 @@ impl ThunderPolicy {
             return None;
         }
         let program_id = info.program_id.unwrap_or("default").to_string();
-        let estimated_tokens = self.estimate_request_tokens(info);
         let timeout_dur = Duration::from_secs(self.config.resume_timeout_secs);
-        let deadline = std::time::Instant::now() + timeout_dur;
+        let deadline = Instant::now() + timeout_dur;
 
         loop {
             // ---- Step 1: acquire lock and try to admit ----
+            // M3: `estimated_tokens` re-computed each iteration since calibration
+            // may have drifted. Saved across the lock drop so force-admit fall-
+            // through after timeout can reuse it.
+            let estimated_tokens: u64;
             let notify = {
                 let mut state = self.state.write().await;
                 let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
                 state.refresh_backends(&urls);
+                estimated_tokens = self.estimate_request_tokens(info, &state);
 
                 // Choose a candidate backend: sticky if assigned & still
                 // healthy, else least-active.
@@ -775,7 +919,7 @@ impl ThunderPolicy {
             };
 
             // ---- Step 2: await Notify with deadline ----
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 warn!(
                     program_id = %program_id,
@@ -805,21 +949,42 @@ impl ThunderPolicy {
     }
 
     /// Conservative token-cost estimate for a request: 4 chars / token for
-    /// the prompt + 256 token completion budget (D-22 simplification — full
-    /// `char_to_token_ratio` calibration deferred to P9).
-    ///
-    /// `&self` is currently unused — kept as a method (rather than an
-    /// associated function) so P9's per-program `char_to_token_ratio`
-    /// momentum (Q5.5) can be wired in by reaching `self.state` without
-    /// touching call sites.
+    /// Estimate token cost of a request (M3 calibrated). Three-tier lookup:
+    /// per-program `local_char_to_token_ratio` → `RouterState.global_*` →
+    /// `NEUTRAL_RATIO=4.0`. Same tiered lookup for completion fraction.
+    /// Caller must hold a `&RouterState` (read or write guard); typically the
+    /// caller is `pick_default_inner` or `pick_tr` which already hold the lock.
     #[expect(
         clippy::unused_self,
-        reason = "method signature stable for P9 char_to_token_ratio calibration"
+        reason = "method signature stable; self may be used in future Tier-2 polish for per-protocol ratio"
     )]
-    fn estimate_request_tokens(&self, info: &SelectWorkerInfo<'_>) -> u64 {
+    fn estimate_request_tokens(&self, info: &SelectWorkerInfo<'_>, state: &RouterState) -> u64 {
         let request_chars = info.request_text.map(str::len).unwrap_or(0);
-        let prompt_estimate = (request_chars / 4) as u64;
-        prompt_estimate.saturating_add(256)
+
+        let chars_per_token = info
+            .program_id
+            .and_then(|pid| state.programs.get(pid))
+            .and_then(|p| p.local_char_to_token_ratio)
+            .or(state.global_char_to_token_ratio)
+            .filter(|r| *r > 0.0)
+            .unwrap_or(NEUTRAL_RATIO);
+        let prompt_estimate = (request_chars as f64 / chars_per_token).ceil() as u64;
+
+        let completion_estimate = match info.declared_max_tokens {
+            Some(mt) if mt > 0 => {
+                let fraction = info
+                    .program_id
+                    .and_then(|pid| state.programs.get(pid))
+                    .and_then(|p| p.local_completion_fraction)
+                    .or(state.global_completion_fraction)
+                    .map(|f| f.clamp(0.0, 1.0))
+                    .unwrap_or(NEUTRAL_FRACTION);
+                (f64::from(mt) * fraction).ceil() as u64
+            }
+            _ => FALLBACK_COMPLETION_TOKENS,
+        };
+
+        prompt_estimate.saturating_add(completion_estimate)
     }
 
     /// Last-resort admit when the resume-timeout deadline fires. Picks the
@@ -982,6 +1147,7 @@ mod tests {
             total_tokens: 80,
             request_text_chars: 200,
             cache_read_input_tokens: None,
+            declared_max_tokens: None,
         })
         .expect("send must succeed (consumer alive)");
 
@@ -1029,6 +1195,7 @@ mod tests {
             total_tokens: 3,
             request_text_chars: 0,
             cache_read_input_tokens: None,
+            declared_max_tokens: None,
         })
         .expect("send");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1148,6 +1315,7 @@ mod tests {
             total_tokens: 100,
             request_text_chars: 40,
             cache_read_input_tokens: None,
+            declared_max_tokens: None,
         })
         .expect("send");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1250,6 +1418,7 @@ mod tests {
             total_tokens: 0,
             request_text_chars: 0,
             cache_read_input_tokens: None,
+            declared_max_tokens: None,
         })
         .expect("send");
 
@@ -1359,7 +1528,7 @@ mod tests {
             request_text: Some("x"),
             ..Default::default()
         };
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let result = policy.select_worker_async(&workers, &info).await;
         let elapsed = start.elapsed();
         assert_eq!(result, Some(0), "force-admit must return the only worker");
@@ -1371,6 +1540,177 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "force-admit should not wait significantly past timeout (took {elapsed:?})"
         );
+    }
+
+    // ===== M3 calibration tests =====
+
+    #[test]
+    fn calibration_first_observation_initializes_directly() {
+        let mut stored: Option<f64> = None;
+        let mut last_at: Option<Instant> = None;
+        let now = Instant::now();
+        update_calibration_with_decay(&mut stored, &mut last_at, 5.5, NEUTRAL_RATIO, now);
+        assert_eq!(stored, Some(5.5), "first observation = direct assign");
+        assert!(last_at.is_some());
+    }
+
+    #[test]
+    fn calibration_ema_no_time_elapsed() {
+        let mut stored: Option<f64> = Some(4.0);
+        let mut last_at: Option<Instant> = Some(Instant::now());
+        let now = last_at.unwrap();
+        update_calibration_with_decay(&mut stored, &mut last_at, 5.0, NEUTRAL_RATIO, now);
+        // 0.2 * 5.0 + 0.8 * 4.0 = 4.2 (no decay since elapsed=0 → retain=1)
+        let v = stored.unwrap();
+        assert!((v - 4.2).abs() < 1e-6, "EMA without decay: got {v}");
+    }
+
+    #[test]
+    fn calibration_decay_with_one_half_life() {
+        let mut stored: Option<f64> = Some(8.0);
+        let t0 = Instant::now();
+        let mut last_at: Option<Instant> = Some(t0);
+        let now = t0 + CALIBRATION_HALF_LIFE; // exactly one half-life
+        update_calibration_with_decay(&mut stored, &mut last_at, 4.0, NEUTRAL_RATIO, now);
+        // retain ≈ 0.5 → decayed = 0.5*8 + 0.5*4 = 6
+        // EMA: 0.2*4 + 0.8*6 = 5.6
+        let v = stored.unwrap();
+        assert!((v - 5.6).abs() < 1e-2, "decay+EMA at one half-life: got {v}");
+    }
+
+    #[tokio::test]
+    async fn estimate_uses_per_program_ratio_when_present()  {
+        let policy = ThunderPolicy::with_defaults();
+        let mut state = RouterState::default();
+        state.programs.insert(
+            "p1".to_string(),
+            Program {
+                program_id: "p1".to_string(),
+                local_char_to_token_ratio: Some(2.0), // half of neutral
+                ..Program::new("p1".to_string())
+            },
+        );
+        let text_for_test = "a".repeat(80);
+        let info = SelectWorkerInfo {
+            request_text: Some(text_for_test.as_str()),
+            program_id: Some("p1"),
+            ..Default::default()
+        };
+        let est = policy.estimate_request_tokens(&info, &state);
+        // 80 chars / 2.0 ratio = 40 prompt + 256 fallback completion = 296
+        assert_eq!(est, 296);
+    }
+
+    #[tokio::test]
+    async fn estimate_falls_through_to_global_when_program_has_no_local()  {
+        let policy = ThunderPolicy::with_defaults();
+        let mut state = RouterState {
+            global_char_to_token_ratio: Some(8.0),
+            ..Default::default()
+        };
+        state.programs.insert(
+            "p1".to_string(),
+            Program::new("p1".to_string()), // no local ratio
+        );
+        let text_for_test = "a".repeat(80);
+        let info = SelectWorkerInfo {
+            request_text: Some(text_for_test.as_str()),
+            program_id: Some("p1"),
+            ..Default::default()
+        };
+        let est = policy.estimate_request_tokens(&info, &state);
+        // 80 / 8 = 10 prompt + 256 = 266
+        assert_eq!(est, 266);
+    }
+
+    #[tokio::test]
+    async fn estimate_falls_through_to_neutral_when_no_calibration()  {
+        let policy = ThunderPolicy::with_defaults();
+        let state = RouterState::default();
+        let text_for_test = "a".repeat(80);
+        let info = SelectWorkerInfo {
+            request_text: Some(text_for_test.as_str()),
+            ..Default::default()
+        };
+        let est = policy.estimate_request_tokens(&info, &state);
+        // 80 / 4.0 (neutral) = 20 prompt + 256 = 276
+        assert_eq!(est, 276);
+    }
+
+    #[tokio::test]
+    async fn estimate_uses_max_tokens_with_completion_fraction()  {
+        let policy = ThunderPolicy::with_defaults();
+        let state = RouterState {
+            global_completion_fraction: Some(0.3),
+            ..Default::default()
+        };
+        let text_for_test = "a".repeat(80);
+        let info = SelectWorkerInfo {
+            request_text: Some(text_for_test.as_str()),
+            declared_max_tokens: Some(1000),
+            ..Default::default()
+        };
+        let est = policy.estimate_request_tokens(&info, &state);
+        // 80/4=20 prompt + 1000*0.3=300 completion = 320
+        assert_eq!(est, 320);
+    }
+
+    #[tokio::test]
+    async fn estimate_completion_falls_back_to_256_when_max_tokens_missing()  {
+        let policy = ThunderPolicy::with_defaults();
+        let state = RouterState::default();
+        let text_for_test = "a".repeat(40);
+        let info = SelectWorkerInfo {
+            request_text: Some(text_for_test.as_str()),
+            declared_max_tokens: None,
+            ..Default::default()
+        };
+        let est = policy.estimate_request_tokens(&info, &state);
+        // 40/4=10 + 256 fallback = 266
+        assert_eq!(est, 266);
+    }
+
+    /// Calibration must update on UsageEvent reaching the consumer.
+    #[tokio::test]
+    async fn calibration_updates_on_usage_event() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        let info = SelectWorkerInfo {
+            program_id: Some("calibrate"),
+            ..Default::default()
+        };
+        let _ = policy.select_worker_async(&workers, &info).await;
+        let tx = policy.usage_sender().expect("sender");
+        tx.send(UsageEvent {
+            program_id: Some("calibrate".to_string()),
+            backend_url: workers[0].url().to_string(),
+            prompt_tokens: 50,
+            completion_tokens: 20,
+            total_tokens: 70,
+            request_text_chars: 200,
+            cache_read_input_tokens: None,
+            declared_max_tokens: Some(100),
+        })
+        .expect("send");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = policy.snapshot_state().await;
+        let p = snap.programs.get("calibrate").expect("program");
+        assert_eq!(
+            p.local_char_to_token_ratio,
+            Some(200.0 / 50.0),
+            "first observation: chars/prompt = 4.0"
+        );
+        assert_eq!(
+            p.local_completion_fraction,
+            Some(0.2),
+            "first observation: 20/100 = 0.2"
+        );
+        assert_eq!(snap.global_char_to_token_ratio, Some(4.0));
+        assert_eq!(snap.global_completion_fraction, Some(0.2));
     }
 
     /// M2: progress_consumer_task drains StreamingProgressEvent and updates
@@ -1454,6 +1794,9 @@ mod tests {
                 total_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
+                local_char_to_token_ratio: None,
+                local_completion_fraction: None,
+                last_calibration_at: None,
             });
         }
 
@@ -1496,6 +1839,9 @@ mod tests {
                 total_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
+                local_char_to_token_ratio: None,
+                local_completion_fraction: None,
+                last_calibration_at: None,
             });
         }
 
@@ -1552,6 +1898,9 @@ mod tests {
                 total_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
+                local_char_to_token_ratio: None,
+                local_completion_fraction: None,
+                last_calibration_at: None,
             });
         }
         {

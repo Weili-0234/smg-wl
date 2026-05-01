@@ -866,6 +866,7 @@ impl PDRouter {
                     headers,
                     hash_ring,
                     program_id: None,
+                    declared_max_tokens: None,
                 },
             )
             .ok_or_else(|| {

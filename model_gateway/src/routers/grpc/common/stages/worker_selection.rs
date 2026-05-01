@@ -177,6 +177,7 @@ impl WorkerSelectionStage {
                     headers,
                     hash_ring,
                     program_id,
+                    declared_max_tokens: None,
                 },
             )
             .await?;
@@ -290,6 +291,7 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
             program_id: None,
+            declared_max_tokens: None,
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info)?;
         let decode_idx = policy.select_worker(&available_decode, &info)?;
