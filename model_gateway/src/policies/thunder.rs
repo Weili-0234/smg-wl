@@ -388,8 +388,17 @@ impl LoadBalancingPolicy for ThunderPolicy {
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
-        let mut state = self.state.write().await;
-        Self::pick_default_inner(&mut state, workers, info, self.config.sub_mode)
+        // ★ Decision tag (autonomous): Default mode keeps the single-locked
+        // fast path (no awaits inside the critical section). TR mode is a
+        // multi-await loop (try-admit → register Notify → drop lock → await
+        // → loop), so it owns its own lock acquisition pattern in `pick_tr`.
+        match self.config.sub_mode {
+            ThunderSubMode::Default => {
+                let mut state = self.state.write().await;
+                Self::pick_default_inner(&mut state, workers, info, ThunderSubMode::Default)
+            }
+            ThunderSubMode::Tr => self.pick_tr(workers, info).await,
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -463,11 +472,13 @@ impl ThunderPolicy {
                 Some(idx)
             }
             ThunderSubMode::Tr => {
-                // P5 will wire capacity-gated admission. Fall back to Default
-                // for now so traffic still flows during partial roll-out.
+                // The async `select_worker_async` dispatches TR to `pick_tr`
+                // before this function is ever reached. Sync `select_worker`
+                // (parity tests + trait-object completeness) cannot await on
+                // a Notify so we degrade gracefully to least-active here.
                 warn!(
-                    "ThunderSubMode::Tr selected but capacity gate not wired (P5); \
-                     falling back to Default"
+                    "ThunderSubMode::Tr called via sync `select_worker`; \
+                     capacity gate skipped (sync path cannot await)"
                 );
                 let chosen_url = state.select_least_active(&urls)?;
                 let idx = workers.iter().position(|w| w.url() == chosen_url)?;
@@ -475,6 +486,173 @@ impl ThunderPolicy {
                 Some(idx)
             }
         }
+    }
+
+    // ---------- TR sub-mode (capacity-gated admission, P5+P6) ----------
+
+    /// TR sub-mode: capacity-aware admission. If the chosen backend has no
+    /// headroom for the program's estimated token cost, register a per-program
+    /// `Notify` and await with a deadline. On wake (or timeout) re-evaluate.
+    ///
+    /// Loop shape (per `Notify::notify_waiters` semantics):
+    ///   1. acquire write-lock, try to admit
+    ///   2. else register Notify → drop lock
+    ///   3. await `notified()` with `timeout(remaining_deadline, ...)`
+    ///   4. on timeout → force-admit fallback (skip capacity check)
+    ///   5. on wake → loop back to step 1
+    ///
+    /// Tokens are *reserved* on the chosen backend at admit time so a herd of
+    /// arrivals doesn't all see the same headroom and double-admit. The
+    /// reservation is un-done by `usage_consumer` when the actual `UsageEvent`
+    /// arrives (see Task 3).
+    async fn pick_tr(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        if workers.is_empty() {
+            return None;
+        }
+        let program_id = info.program_id.unwrap_or("default").to_string();
+        let estimated_tokens = self.estimate_request_tokens(info);
+        let timeout_dur = Duration::from_secs(self.config.resume_timeout_secs);
+        let deadline = std::time::Instant::now() + timeout_dur;
+
+        loop {
+            // ---- Step 1: acquire lock and try to admit ----
+            let notify = {
+                let mut state = self.state.write().await;
+                let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+                state.refresh_backends(&urls);
+
+                // Choose a candidate backend: sticky if assigned & still
+                // healthy, else least-active.
+                let chosen_url = state
+                    .programs
+                    .get(&program_id)
+                    .and_then(|p| p.backend_url.clone())
+                    .filter(|u| urls.contains(u))
+                    .or_else(|| state.select_least_active(&urls));
+
+                let Some(chosen_url) = chosen_url else {
+                    return None; // no backends in registry
+                };
+
+                if state.has_capacity(
+                    &chosen_url,
+                    estimated_tokens,
+                    self.config.capacity_reserved_fraction,
+                ) {
+                    let Some(idx) = workers.iter().position(|w| w.url() == chosen_url) else {
+                        return None;
+                    };
+                    state.assign(&program_id, &chosen_url);
+                    // Reserve the estimate so concurrent arrivals to the
+                    // same backend see the load and pause.
+                    if let Some(b) = state.backends.get_mut(&chosen_url) {
+                        b.active_program_tokens =
+                            b.active_program_tokens.saturating_add(estimated_tokens);
+                    }
+                    if let Some(p) = state.programs.get_mut(&program_id) {
+                        p.estimated_reserved_tokens = p
+                            .estimated_reserved_tokens
+                            .saturating_add(estimated_tokens);
+                    }
+                    debug!(
+                        program_id = %program_id,
+                        backend = %chosen_url,
+                        est = estimated_tokens,
+                        "thunder TR admit"
+                    );
+                    return Some(idx);
+                }
+
+                // Block: register a Notify for this program. Note the
+                // `notified()` future MUST be created AFTER the next pause
+                // checkpoint — registering it inside the locked region here
+                // is wrong (it would be dropped on drop(state)). We return
+                // the Arc<Notify> and create the future just below.
+                let n = state.waiting_event_for(&program_id);
+                debug!(
+                    program_id = %program_id,
+                    backend = %chosen_url,
+                    est = estimated_tokens,
+                    cap = state.backends.get(&chosen_url).map(|b| b.capacity_tokens).unwrap_or(0),
+                    used = state.backends.get(&chosen_url).map(|b| b.active_program_tokens).unwrap_or(0),
+                    "thunder TR pause (full)"
+                );
+                n
+                // lock dropped here at end of block
+            };
+
+            // ---- Step 2: await Notify with deadline ----
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    program_id = %program_id,
+                    "thunder TR force-resume on timeout (deadline already passed)"
+                );
+                return self
+                    .force_admit_after_timeout(workers, &program_id, estimated_tokens)
+                    .await;
+            }
+            // Subtle: register the future BEFORE awaiting. `Notify::notified`
+            // returns a future that registers when first polled; awaiting
+            // through `tokio::time::timeout` polls it once which is enough.
+            let waited = tokio::time::timeout(remaining, notify.notified()).await;
+            if waited.is_err() {
+                warn!(
+                    program_id = %program_id,
+                    "thunder TR force-resume on timeout"
+                );
+                return self
+                    .force_admit_after_timeout(workers, &program_id, estimated_tokens)
+                    .await;
+            }
+            // Notified — loop and re-check capacity. May still be full
+            // (broadcast wake notifies all waiters), in which case we
+            // re-pause.
+        }
+    }
+
+    /// Conservative token-cost estimate for a request: 4 chars / token for
+    /// the prompt + 256 token completion budget (D-22 simplification — full
+    /// `char_to_token_ratio` calibration deferred to P9).
+    fn estimate_request_tokens(&self, info: &SelectWorkerInfo<'_>) -> u64 {
+        let request_chars = info.request_text.map(str::len).unwrap_or(0);
+        let prompt_estimate = (request_chars / 4) as u64;
+        prompt_estimate.saturating_add(256)
+    }
+
+    /// Last-resort admit when the resume-timeout deadline fires. Picks the
+    /// least-active backend regardless of capacity and reserves the estimate
+    /// so usage_consumer can un-reserve it on completion.
+    async fn force_admit_after_timeout(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        program_id: &str,
+        estimated_tokens: u64,
+    ) -> Option<usize> {
+        let mut state = self.state.write().await;
+        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        state.refresh_backends(&urls);
+        let chosen_url = state.select_least_active(&urls)?;
+        let idx = workers.iter().position(|w| w.url() == chosen_url)?;
+        state.assign(program_id, &chosen_url);
+        if let Some(b) = state.backends.get_mut(&chosen_url) {
+            b.active_program_tokens = b.active_program_tokens.saturating_add(estimated_tokens);
+        }
+        if let Some(p) = state.programs.get_mut(program_id) {
+            p.estimated_reserved_tokens =
+                p.estimated_reserved_tokens.saturating_add(estimated_tokens);
+        }
+        debug!(
+            program_id = %program_id,
+            backend = %chosen_url,
+            est = estimated_tokens,
+            "thunder TR force-admit after timeout"
+        );
+        Some(idx)
     }
 }
 
