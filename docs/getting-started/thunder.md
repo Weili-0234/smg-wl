@@ -2,7 +2,7 @@
 title: ThunderAgent (Program-Aware Routing)
 ---
 
-# ThunderAgent algorithm as a Routing Policy
+# ThunderAgent Algorithm as a Routing Policy
 
 [ThunderAgent](https://github.com/ThunderAgent-org/ThunderAgent) is a **program-level** scheduling algorithm designed for agent workloads, making automatic tradeoffs between load-balancing and kv cache affinity. Instead of scheduling each request independently, ThunderAgent groups requests by `program_id` and routes requests from the same program to the same backend whenever possible — maximizing KV cache reuse — while pausing agentic programs' incoming requests based on backend's kv cache capacity to avoid thrashing - and resuming programs on backends with the least workload.
 

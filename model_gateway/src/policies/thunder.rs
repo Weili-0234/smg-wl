@@ -305,7 +305,13 @@ impl RouterState {
     /// immediately un-reserve and update status. Idempotent.
     fn pause_until_safe(&mut self, pid: &str, backend_url: &str) {
         let Some(p) = self.programs.get_mut(pid) else { return };
-        if p.status == ProgramStatus::Acting {
+        // M4 + concurrency safety: any program with in-flight requests cannot
+        // be cleanly preempted. The bytes are already streaming back to the
+        // client; clearing the reservation now would mis-account capacity.
+        // Defer pause via marked_for_pause (taken when in_flight reaches 0
+        // via check_marked_for_pause from usage_consumer / Drop).
+        // This subsumes the Acting-state check (Acting always implies in_flight>0).
+        if p.status == ProgramStatus::Acting || p.in_flight > 0 {
             p.marked_for_pause = true;
             return;
         }
@@ -435,14 +441,10 @@ impl RouterState {
         }
     }
 
-    /// M4: check `marked_for_pause` flag and apply deferred pause when status
-    /// transitions out of Acting. Called from success paths of streaming
-    /// usage extraction + non-streaming response completion + Drop fallback
-    /// (call sites added in M5+M6 once Acting-state transitions wire up).
-    #[cfg_attr(not(test), expect(
-        dead_code,
-        reason = "M5/M6 wire the production call sites; tests cover the logic now"
-    ))]
+    /// M4: check `marked_for_pause` flag and apply deferred pause when the
+    /// program is no longer in-flight. Called from `usage_consumer_task`
+    /// (success path) and `ProgramRequestGuard::Drop` (error/disconnect
+    /// path) — both points where in_flight may have just reached 0.
     pub(crate) fn check_marked_for_pause(&mut self, pid: &str) {
         let (mark, url) = match self.programs.get(pid) {
             Some(p) if p.marked_for_pause && p.status != ProgramStatus::Acting => {
@@ -703,6 +705,10 @@ impl ThunderPolicy {
                         );
                     }
                 }
+                // M4: take any deferred pause if the request that just
+                // completed brought in_flight to 0 while marked_for_pause
+                // was set by the scheduler during the in-flight window.
+                guard.check_marked_for_pause(&pid);
 
                 // Broadcast wake — capacity may have freed for any
                 // currently-paused program. ★ Decision tag (autonomous):
@@ -917,6 +923,9 @@ impl Drop for ProgramRequestGuard {
                     p.in_flight -= 1;
                 }
             }
+            // M4: take any deferred pause if the disconnect just brought
+            // in_flight to 0 while marked_for_pause is set.
+            guard.check_marked_for_pause(&pid);
             // A slot may have freed — broadcast so paused programs re-check.
             // (M6 will replace broadcast with a scheduler signal.)
             let waiting: Vec<Arc<Notify>> = guard.waiting_events.values().cloned().collect();
@@ -1803,6 +1812,77 @@ mod tests {
 
     // ===== M5+M6 BFD greedy_resume + targeted notify tests =====
 
+    /// CRITICAL Python-parity test: a program paused on backend X must be
+    /// allowed to resume on backend Y if Y has the most remaining capacity.
+    /// This validates that BFD greedy_resume relocates programs across
+    /// backends, not just resumes them on the same backend.
+    #[test]
+    fn paused_program_resumes_on_different_backend_with_capacity() {
+        let mut state = RouterState::default();
+        // Backend X: where program was originally running but now over-loaded
+        // by other programs (simulated: low remaining cap).
+        state.backends.insert(
+            "X".to_string(),
+            BackendState {
+                active_programs: ["other".to_string()].into_iter().collect(),
+                active_program_tokens: 950, // X is nearly full from "other"
+                capacity_tokens: 1000,
+            },
+        );
+        // Backend Y: was empty, just freed up.
+        state.backends.insert(
+            "Y".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 1000,
+            },
+        );
+
+        // Program P was running on X, then got proactively paused (backend_url
+        // cleared on pause; this is the post-pause state).
+        let mut p = Program::new("relocate-me".to_string());
+        p.status = ProgramStatus::Paused;
+        p.total_tokens = 200; // BFD will use 200 as resume estimate
+        p.paused_at = Some(Instant::now());
+        p.backend_url = None;
+        state.programs.insert("relocate-me".to_string(), p);
+        state
+            .waiting_events
+            .insert("relocate-me".to_string(), Arc::new(Notify::new()));
+
+        // BFD greedy_resume should pick Y (1000 free) over X (50 free)
+        // because est=200 doesn't fit in X but fits in Y.
+        state.try_greedy_resume();
+
+        let resumed = state.programs.get("relocate-me").unwrap();
+        assert_eq!(
+            resumed.status,
+            ProgramStatus::Reasoning,
+            "must transition out of Paused"
+        );
+        assert_eq!(
+            resumed.backend_url.as_deref(),
+            Some("Y"),
+            "MUST resume on Y (different from original X), not X"
+        );
+        assert_eq!(
+            resumed.estimated_reserved_tokens, 200,
+            "reservation transferred to new backend"
+        );
+        // Y's accounting reflects the new program.
+        let y = state.backends.get("Y").unwrap();
+        assert_eq!(y.active_program_tokens, 200, "Y now booked with P's reservation");
+        assert!(
+            y.active_programs.contains("relocate-me"),
+            "P registered on Y"
+        );
+        // X's accounting unchanged (P was already removed at pause time).
+        let x = state.backends.get("X").unwrap();
+        assert_eq!(x.active_program_tokens, 950);
+        assert!(!x.active_programs.contains("relocate-me"));
+    }
+
     #[test]
     fn bfd_assigns_largest_program_to_most_remaining_backend() {
         let mut state = RouterState::default();
@@ -2022,7 +2102,8 @@ mod tests {
     }
 
     #[test]
-    fn pause_until_safe_immediate_for_reasoning() {
+    fn pause_until_safe_immediate_when_idle() {
+        // Reasoning + in_flight=0 (e.g. between requests) → safe to pause immediately.
         let mut state = RouterState::default();
         let url = "http://b1:8000".to_string();
         state.backends.insert(
@@ -2038,14 +2119,14 @@ mod tests {
             Program {
                 program_id: "v".to_string(),
                 backend_url: Some(url.clone()),
-                in_flight: 1,
+                in_flight: 0, // no request currently running
                 total_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
                 local_char_to_token_ratio: None,
                 local_completion_fraction: None,
                 last_calibration_at: None,
-                status: ProgramStatus::Reasoning,
+                status: ProgramStatus::Idle,
                 marked_for_pause: false,
                 paused_at: None,
             },
@@ -2059,6 +2140,58 @@ mod tests {
         let b = state.backends.get(&url).unwrap();
         assert_eq!(b.active_program_tokens, 0);
         assert!(!b.active_programs.contains("v"));
+    }
+
+    #[test]
+    fn pause_until_safe_defers_in_flight_request() {
+        // Concurrency safety: any program with in_flight > 0 must defer
+        // pause via marked_for_pause, never immediately un-reserve. Otherwise
+        // an actively-streaming request would have its capacity accounting
+        // cleared while bytes are still flowing.
+        let mut state = RouterState::default();
+        let url = "http://b1:8000".to_string();
+        state.backends.insert(
+            url.clone(),
+            BackendState {
+                active_programs: ["w".to_string()].into_iter().collect(),
+                active_program_tokens: 500,
+                capacity_tokens: 1000,
+            },
+        );
+        state.programs.insert(
+            "w".to_string(),
+            Program {
+                program_id: "w".to_string(),
+                backend_url: Some(url.clone()),
+                in_flight: 1, // request actively running
+                total_tokens: 0,
+                step_count: 1,
+                estimated_reserved_tokens: 500,
+                local_char_to_token_ratio: None,
+                local_completion_fraction: None,
+                last_calibration_at: None,
+                status: ProgramStatus::Reasoning,
+                marked_for_pause: false,
+                paused_at: None,
+            },
+        );
+        state.pause_until_safe("w", &url);
+        let p = state.programs.get("w").unwrap();
+        assert_eq!(
+            p.status,
+            ProgramStatus::Reasoning,
+            "must NOT immediately pause — still in-flight"
+        );
+        assert!(p.marked_for_pause, "must defer via marked_for_pause");
+        assert_eq!(
+            p.estimated_reserved_tokens, 500,
+            "reservation must NOT be cleared while request still running"
+        );
+        let b = state.backends.get(&url).unwrap();
+        assert_eq!(
+            b.active_program_tokens, 500,
+            "backend accounting must stay intact while in-flight"
+        );
     }
 
     #[test]
@@ -2117,14 +2250,14 @@ mod tests {
                 Program {
                     program_id: pid.to_string(),
                     backend_url: Some(url.clone()),
-                    in_flight: 1,
+                    in_flight: 0, // idle programs (between requests) — eligible for immediate pause
                     total_tokens: 0,
                     step_count: step,
                     estimated_reserved_tokens: 320,
                     local_char_to_token_ratio: None,
                     local_completion_fraction: None,
                     last_calibration_at: None,
-                    status: ProgramStatus::Reasoning,
+                    status: ProgramStatus::Idle,
                     marked_for_pause: false,
                     paused_at: None,
                 },

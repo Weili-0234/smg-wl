@@ -995,3 +995,17 @@ Program lifecycle state machine added: `ProgramStatus { Idle, Reasoning, Acting,
 **D-37 (partial)**: Cross-protocol per-program calibration (`Program.local_char_to_token_ratio_by_protocol: HashMap<SseProtocol, f64>`) — deferred as Tier 2 polish. Current state: single `local_char_to_token_ratio` per program; if a program uses multiple protocols (rare in practice), the EMA tracks the mix. The neutral-fallback-on-decay behavior naturally handles drift if protocols change.
 
 **Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.8
+
+## D-38 (2026-05-01): Phase 7 follow-up — concurrency safety: defer pause for in-flight programs
+
+`<SIGNED-OFF>` Bug surfaced by user review: `pause_until_safe` only deferred pause for `ProgramStatus::Acting` programs, but the Acting transition was never wired (programs only transition Idle → Reasoning → Idle). This meant the scheduler could preempt programs with in-flight requests, clearing their backend reservation while bytes were still streaming — corrupting capacity accounting.
+
+**Fix**: extend the deferred-pause guard in `pause_until_safe` to also fire for `p.in_flight > 0` (subsumes the Acting case, since Acting always implies in_flight > 0). Programs with running requests now mark for pause; the deferred pause is taken on the next `usage_consumer` event or `Drop` cleanup that brings in_flight to 0.
+
+**Wiring**: `usage_consumer_task` and `ProgramRequestGuard::Drop` both now call `guard.check_marked_for_pause(&pid)` after decrementing in_flight. The `#[cfg_attr(not(test), expect(dead_code))]` annotation removed from `check_marked_for_pause` since it now has production call sites.
+
+**Tests**: replaced `pause_until_safe_immediate_for_reasoning` (which assumed the buggy "pause regardless of in_flight" behavior) with two tests: `pause_until_safe_immediate_when_idle` (in_flight=0 → immediate pause) and `pause_until_safe_defers_in_flight_request` (in_flight>0 → marked, accounting preserved).
+
+Plus a CRITICAL Python-parity test: `paused_program_resumes_on_different_backend_with_capacity` — verifies BFD greedy_resume relocates programs from over-loaded backend X to free backend Y. 42/42 thunder tests pass; clippy strict clean.
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.4 (M4 deferred-pause semantics)
