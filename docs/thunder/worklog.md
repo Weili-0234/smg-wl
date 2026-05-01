@@ -498,3 +498,60 @@ Weili Xu, 2026-04-30 session ("好，就用 Option α").
 ### Approved by
 
 (Pending user review.)
+
+---
+
+## D-19: P3 implementation completed — ThunderPolicy skeleton lands
+
+**Date**: 2026-05-01
+**Spec ref**: `docs/thunder/10-phases.md` P3 row, `docs/thunder/04-smg-integration.md` §5.1-5.4
+**Approval mode**: <CLAUDE-AUTONOMOUS-DECISION> — Claude trimmed scope; user sign-off pending
+
+### What landed
+
+- New `model_gateway/src/policies/thunder.rs` (~330 LOC including tests): `Program`, `BackendState`, `RouterState`, `ThunderConfig`, `ThunderSubMode { Default, Tr }`, `ThunderPolicy`
+- `LoadBalancingPolicy` impl with sync + async select (Default sub-mode = least-active-program-count + sticky routing on `program_id`)
+- `PolicyConfig::Thunder` variant with D-4 default values + `name()` arm + factory wiring in both `create_from_config` and `create_by_name`
+- `config::validation::validate_policy` extended with a `Thunder` arm (rejects unknown sub_mode, capacity fraction outside `[0.0, 1.0]`, or zero `scheduler_tick_ms`) — required to keep the exhaustive match green; not in the original plan but in scope per "adapt struct construction to match what the codebase exposes"
+- CLI: `--policy thunder` accepted; new `--thunder-{sub-mode,capacity-reserved-fraction,resume-timeout-secs,scheduler-tick-ms}` flags
+- e2e: `smg_thunder_router` conftest fixture + 3 test cases proving `--policy thunder` routes traffic
+- 4 unit tests in `policies::thunder::tests` cover least-active select, sticky routing, fallback key, snapshot
+- 2 added factory tests for `PolicyConfig::Thunder` and `create_by_name("thunder"/"Thunder")`
+
+### What did NOT change (deferred per autonomous trim)
+
+- `usage_consumer` task → P4
+- HTTP usage tail extractor (SSE parse for token counts) → P4
+- `stream_options.include_usage = true` injection → P4
+- `WorkerRegistry::subscribe_events` integration → P5
+- TR sub-mode capacity gate → P5
+- Pause/resume + BFD + force-timeout → P6
+- `ProgramRequestGuard` RAII → P6
+- gRPC validation → P7
+- Profiling endpoints → P8
+
+### Autonomous decisions made (require user review)
+
+1. **P3 scope trim**: ship "ThunderPolicy compiles + routes traffic" only; usage tracking + capacity + pause/resume layered into P4-P6. Rationale: prioritize "能跑" over feature-complete given user's explicit time pressure.
+2. **`tokio::sync::RwLock<RouterState>` (not parking_lot)**: enables future `.await` inside a held lock if TR mode needs it. D-3 single-mutex perf footgun acknowledged; benchmark in P9.
+3. **`needs_request_text() = false`**: Default mode doesn't consult cache; saves the `extract_text_for_routing` call on every request.
+4. **Tr sub-mode falls back to Default with a warn log** rather than `unimplemented!()` panic: keeps the gateway running if a user sets `--thunder-sub-mode tr` before P5 lands. P5 will replace this with the real capacity gate.
+5. **Q5.2 fallback**: `program_id_hint() == None` resolves to a `"default"` pseudo-program; all such requests land on the same backend (sticky on the literal "default" key). Matches Python ThunderAgent behavior.
+6. **Sync `select_worker` uses `blocking_write`**: only safe outside an async runtime. The canonical entry is `select_worker_async`; the sync impl exists for trait-object completeness + P1's parity tests. Documented in code comments.
+7. **e2e fixture passes a free `--prometheus-port`**: discovered that two SMG instances in the same pytest session collide on the default `:29000` Prometheus port (panic at `metrics_server.rs:59`). Allocating a free port per fixture lets `smg_router` (cache_aware) and `smg_thunder_router` (thunder) coexist. Not in the original plan, but blocking the e2e green light without it. Documented in conftest comment.
+
+### Footguns surfaced
+
+1. `select_worker` (sync) calling `state.blocking_write()` will panic if invoked from inside a tokio runtime. Production routers always use the async path; this only matters if a future caller forgets.
+2. Sub-mode is a `String` in `PolicyConfig::Thunder` (not enum) for serde compatibility — typos result in a warn-log fallback to Default rather than an error in the factory; the validator does reject them at config-load time.
+3. Two SMG instances in the same test session collide on `:29000` metrics port. Both Thunder and the next-phase fixtures must allocate free metrics ports.
+
+### Revisit conditions
+
+1. If P5+ shows that contention on the single `RwLock<RouterState>` is measurable → migrate to per-backend sharding.
+2. If "default" pseudo-program causes load imbalance (all unidentified requests stick to one backend) → consider hashing the request body to spread.
+3. If a future user sets `--thunder-sub-mode tr` before P5 → confirm the warn-fallback behavior is acceptable; otherwise reject at validate_compatibility.
+
+### Approved by
+
+(Pending Claude review + user sign-off.)
