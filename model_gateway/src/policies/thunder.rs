@@ -19,10 +19,13 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedSender},
+    RwLock,
+};
 use tracing::{debug, trace, warn};
 
-use super::{thunder_metrics, LoadBalancingPolicy, SelectWorkerInfo};
+use super::{thunder_metrics, LoadBalancingPolicy, SelectWorkerInfo, UsageEvent};
 use crate::worker::Worker;
 
 /// Sub-mode selector. Phase 3 only implements `Default`. `Tr` (transactional)
@@ -178,6 +181,11 @@ pub struct ThunderPolicy {
         reason = "owned by the spawned poll task via clone; field kept for Debug + future direct use in P5+"
     )]
     metrics_client: Arc<dyn thunder_metrics::MetricsClient>,
+    /// Sender side of the usage-event channel. Routers fire-and-forget a
+    /// `UsageEvent` here on every successful non-streaming response; the
+    /// consumer task spawned in `with_metrics_client` updates per-program +
+    /// per-backend token totals.
+    usage_tx: UnboundedSender<UsageEvent>,
 }
 
 impl ThunderPolicy {
@@ -202,6 +210,8 @@ impl ThunderPolicy {
         metrics_client: Arc<dyn thunder_metrics::MetricsClient>,
     ) -> Self {
         let state = Arc::new(RwLock::new(RouterState::default()));
+
+        // ----- capacity poll task -----
         let poll_secs = config.capacity_poll_interval_secs.max(1);
         let state_for_poll = Arc::downgrade(&state);
         let mc_for_poll = metrics_client.clone();
@@ -242,10 +252,55 @@ impl ThunderPolicy {
             }
         });
 
+        // ----- usage_consumer task -----
+        // Unbounded channel — backpressure tradeoff (D-2): routers fire-and-forget
+        // and must not block the response path. If the consumer falls far behind,
+        // memory grows; this is acceptable because each event is ~64B and the
+        // consumer is a tight async loop. Bounded + try_send considered for P9
+        // if benchmarks show pathological growth.
+        let (usage_tx, mut usage_rx) = unbounded_channel::<UsageEvent>();
+        let state_for_consumer = Arc::downgrade(&state);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fire-and-forget usage consumer — exits when the channel closes (policy dropped) via Weak::upgrade returning None or recv returning None"
+        )]
+        tokio::spawn(async move {
+            while let Some(event) = usage_rx.recv().await {
+                let Some(state_arc) = state_for_consumer.upgrade() else {
+                    debug!("ThunderPolicy state dropped; usage consumer exiting");
+                    return;
+                };
+                let pid = event
+                    .program_id
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                let mut guard = state_arc.write().await;
+                if let Some(p) = guard.programs.get_mut(&pid) {
+                    p.total_tokens = p.total_tokens.saturating_add(u64::from(event.total_tokens));
+                    if p.in_flight > 0 {
+                        p.in_flight -= 1;
+                    }
+                }
+                if let Some(b) = guard.backends.get_mut(&event.backend_url) {
+                    b.active_program_tokens = b
+                        .active_program_tokens
+                        .saturating_add(u64::from(event.total_tokens));
+                }
+                trace!(
+                    program_id = %pid,
+                    backend = %event.backend_url,
+                    total_tokens = event.total_tokens,
+                    "usage applied"
+                );
+            }
+            debug!("usage_consumer channel closed; task exiting");
+        });
+
         Self {
             config,
             state,
             metrics_client,
+            usage_tx,
         }
     }
 
@@ -296,6 +351,14 @@ impl LoadBalancingPolicy for ThunderPolicy {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    /// Hand the router a `Sender` so it can fire-and-forget a `UsageEvent`
+    /// after each successful non-streaming response. The consumer task
+    /// spawned in `with_metrics_client` drains the channel and updates
+    /// per-program + per-backend token counters.
+    fn usage_sender(&self) -> Option<&UnboundedSender<UsageEvent>> {
+        Some(&self.usage_tx)
     }
 }
 
@@ -445,5 +508,101 @@ mod tests {
         let prog = &state.programs["snap-test"];
         assert!(prog.backend_url.is_some());
         assert_eq!(prog.step_count, 1);
+    }
+
+    /// Stub `MetricsClient` for unit tests — no HTTP, returns a fixed capacity.
+    #[derive(Debug, Default)]
+    struct StubMetrics;
+    #[async_trait]
+    impl thunder_metrics::MetricsClient for StubMetrics {
+        async fn fetch_capacity(
+            &self,
+            _worker_url: &str,
+        ) -> Result<thunder_metrics::BackendCapacity, String> {
+            Ok(thunder_metrics::BackendCapacity {
+                capacity_tokens: 10_000,
+                model_name: Some("stub-model".to_string()),
+            })
+        }
+    }
+
+    /// Sending a UsageEvent through `policy.usage_sender()` must reach the
+    /// consumer task and bump `Program.total_tokens` for the matching pid.
+    #[tokio::test]
+    async fn usage_event_updates_program_total_tokens() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        // Route once so the program exists in state (in_flight increments to 1).
+        let workers = mock_workers(2);
+        let info = SelectWorkerInfo {
+            program_id: Some("usage-test"),
+            ..Default::default()
+        };
+        let _ = policy.select_worker_async(&workers, &info).await;
+
+        let tx = policy
+            .usage_sender()
+            .expect("ThunderPolicy must expose a usage sender");
+        tx.send(UsageEvent {
+            program_id: Some("usage-test".to_string()),
+            backend_url: workers[0].url().to_string(),
+            prompt_tokens: 50,
+            completion_tokens: 30,
+            total_tokens: 80,
+            request_text_chars: 200,
+        })
+        .expect("send must succeed (consumer alive)");
+
+        // Give the consumer a brief moment to drain. Yield doesn't always
+        // schedule the spawned task; sleep a tiny amount.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state = policy.snapshot_state().await;
+        let prog = state
+            .programs
+            .get("usage-test")
+            .expect("program must exist after route");
+        assert_eq!(prog.total_tokens, 80, "usage event must add to total_tokens");
+        assert_eq!(prog.in_flight, 0, "consumer must decrement in_flight on event");
+
+        let backend = state
+            .backends
+            .get(workers[0].url())
+            .expect("backend state must exist");
+        assert_eq!(
+            backend.active_program_tokens, 80,
+            "backend active_program_tokens must accumulate"
+        );
+    }
+
+    /// `program_id = None` on the event must default to the "default" pid
+    /// (matches the routing-side fallback in `pick_default_inner`).
+    #[tokio::test]
+    async fn usage_event_with_none_pid_targets_default_pseudo_program() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        // Route with no pid → creates "default" program entry.
+        let _ = policy
+            .select_worker_async(&workers, &SelectWorkerInfo::default())
+            .await;
+        let tx = policy.usage_sender().expect("usage sender must be Some");
+        tx.send(UsageEvent {
+            program_id: None,
+            backend_url: workers[0].url().to_string(),
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            request_text_chars: 0,
+        })
+        .expect("send");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let state = policy.snapshot_state().await;
+        let prog = state.programs.get("default").expect("default program");
+        assert_eq!(prog.total_tokens, 3);
     }
 }
