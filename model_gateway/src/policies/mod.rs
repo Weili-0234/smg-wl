@@ -24,6 +24,7 @@ mod random;
 mod registry;
 mod round_robin;
 mod thunder;
+mod thunder_metrics;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
@@ -40,6 +41,7 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 pub use thunder::ThunderPolicy;
+pub use thunder_metrics::{BackendCapacity, HttpMetricsClient, MetricsClient};
 
 /// Per-request usage event emitted by routers after the upstream stream completes.
 ///
