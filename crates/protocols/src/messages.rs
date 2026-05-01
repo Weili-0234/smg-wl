@@ -179,6 +179,13 @@ pub struct Metadata {
     /// An external identifier for the user who is associated with the request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+
+    /// SMG-specific program identifier used by program-aware load-balancing
+    /// policies (Thunder) to group requests for capacity tracking and
+    /// pause/resume scheduling. Not part of the upstream Anthropic spec;
+    /// safely omitted from outbound requests when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program_id: Option<String>,
 }
 
 /// Service tier options
@@ -1819,8 +1826,27 @@ pub enum ServerToolCaller {
 #[cfg(test)]
 mod tests {
     use serde_json;
+    use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn metadata_deserializes_program_id() {
+        let v = json!({"user_id": "u1", "program_id": "agent-step-42"});
+        let m: Metadata = serde_json::from_value(v).unwrap();
+        assert_eq!(m.program_id.as_deref(), Some("agent-step-42"));
+        assert_eq!(m.user_id.as_deref(), Some("u1"));
+    }
+
+    #[test]
+    fn metadata_serializes_skips_none_program_id() {
+        let m = Metadata {
+            user_id: Some("u1".into()),
+            program_id: None,
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v, json!({"user_id": "u1"}));
+    }
 
     fn base_request() -> CreateMessageRequest {
         CreateMessageRequest {
