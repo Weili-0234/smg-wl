@@ -117,6 +117,31 @@ def make_handler(state: MockState):
                 self._send_json(200, state.snapshot())
             elif self.path == "/health":
                 self._send_text(200, "ok\n")
+            elif self.path == "/v1/models":
+                # Advertise the configured model so SMG's worker registry
+                # accepts requests for it. SMG hits /v1/models on each worker
+                # at registration time (detect_backend.rs) and on cache miss
+                # (worker_selection.rs). owned_by="vllm" lets the backend
+                # detector classify this mock as a vLLM HTTP worker; root
+                # mirrors the served model id so vllm metadata discovery
+                # populates model_path.
+                snap = state.snapshot()
+                self._send_json(200, {
+                    "object": "list",
+                    "data": [{
+                        "id": snap["model_name"],
+                        "object": "model",
+                        "created": int(time.time()),
+                        "owned_by": "vllm",
+                        "root": snap["model_name"],
+                        "max_model_len": 32768,
+                    }],
+                })
+            elif self.path == "/version":
+                # vLLM exposes /version; SMG's HTTP backend detector treats
+                # a 200 from /version as a strong signal that this worker
+                # is vLLM (detect_backend.rs::try_vllm_version).
+                self._send_json(200, {"version": "0.0.0-mock"})
             else:
                 self._send_text(404, f"not found: {self.path}\n")
 

@@ -45,8 +45,16 @@ def _wait_http(url: str, timeout: float = 10.0) -> None:
 def mock_backend():
     """Start the mock_vllm.py backend; yield its base URL; stop it on teardown."""
     port = _free_port()
+    # The Phase 0 e2e tests post requests with model="Qwen/Qwen3-0.6B"; have
+    # the mock advertise that id via /v1/models so SMG's worker registry
+    # accepts the routing.
     proc = subprocess.Popen(
-        ["python3", os.path.join(THUNDER_DIR, "mock_vllm.py"), "--port", str(port)],
+        [
+            "python3",
+            os.path.join(THUNDER_DIR, "mock_vllm.py"),
+            "--port", str(port),
+            "--model-name", "Qwen/Qwen3-0.6B",
+        ],
         cwd=THUNDER_DIR,
     )
     try:
