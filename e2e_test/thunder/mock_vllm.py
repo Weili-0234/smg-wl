@@ -4,16 +4,14 @@
 Pure stdlib (no pip install needed) — uses http.server.ThreadingHTTPServer.
 Mimics the subset of vLLM's HTTP API that Thunder cares about:
 
-  POST /v1/chat/completions
-       Non-streaming: returns a canned ChatCompletion JSON.
-       Streaming (stream=true in body): emits SSE chunks ending with [DONE].
-  GET  /get_server_info
-       Returns vLLM's cache-config-shaped JSON. Capacity is configurable per-process.
-  POST /control/capacity   (test-only knob)
-       JSON {"num_kv_cache_blocks": N}. Lets a test dynamically shrink/expand
-       reported capacity to drive Thunder's pause/resume scheduler in Phase 8.
-  GET  /control/state      (test-only)
-       Returns current mock state (capacity, request count) for assertions.
+  POST /v1/chat/completions      OpenAI Chat (canonical)
+  POST /v1/messages              Anthropic Messages (P0+; OpenAI-shape response)
+  POST /v1/responses             OpenAI Responses (P2+; OpenAI-shape response)
+  GET  /v1/models                vLLM-compat for SMG worker discovery
+  GET  /version                  vLLM-compat for SMG worker discovery
+  GET  /get_server_info          vLLM cache-config-shaped JSON
+  POST /control/capacity         Test knob: dynamically resize KV capacity
+  GET  /control/state            Test introspection
 
 Run:
     python3 mock_vllm.py --port 8001
@@ -150,6 +148,8 @@ def make_handler(state: MockState):
                 self._handle_chat()
             elif self.path == "/v1/messages":
                 self._handle_messages()
+            elif self.path == "/v1/responses":
+                self._handle_responses()
             elif self.path == "/control/capacity":
                 self._handle_capacity_update()
             else:
@@ -300,6 +300,60 @@ def make_handler(state: MockState):
                 },
                 # Echo the program_id so the e2e test can assert plumbing worked.
                 "_mock_echo_program_id": program_id,
+            }
+            self._send_json(200, payload_out)
+
+        # ---------- /v1/responses handler (Phase 2 multi-protocol smoke) ----------
+        def _handle_responses(self) -> None:
+            """OpenAI Responses API endpoint. Like _handle_messages, returns an
+            OpenAI chat.completion shape — matches what a litellm-proxy sidecar
+            produces after Responses-in → Chat-in upstream translation. Phase 2
+            tests assert pass-through, not body-shape compliance.
+            """
+            payload = self._read_json_body()
+            with state.lock:
+                state.request_count += 1
+                req_idx = state.request_count
+            stream = bool(payload.get("stream"))
+            # Responses API uses `input` field (string or array) instead of `messages`.
+            input_field = payload.get("input")
+            metadata = payload.get("metadata") or {}
+            program_id = metadata.get("program_id")
+            LOG.info(
+                "responses #%d stream=%s has_input=%s program_id=%s",
+                req_idx, stream, input_field is not None, program_id or "<none>",
+            )
+            if stream:
+                self._stream_chat(req_idx)
+                return
+            content = state.canned_content
+            # Approximate prompt size from input field
+            if isinstance(input_field, str):
+                prompt_chars = len(input_field)
+            elif isinstance(input_field, list):
+                prompt_chars = sum(len(str(item)) for item in input_field)
+            else:
+                prompt_chars = 0
+            prompt_tokens = max(1, prompt_chars // 4)
+            completion_tokens = max(1, len(content) // 4)
+            payload_out = {
+                "id": f"chatcmpl-mock-{req_idx}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": state.model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+                # Echo program_id so e2e can assert plumbing
+                "_mock_echo_program_id": program_id,
+                "_mock_endpoint": "/v1/responses",
             }
             self._send_json(200, payload_out)
 
