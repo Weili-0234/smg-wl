@@ -2304,6 +2304,47 @@ mod tests {
         assert_eq!(est, 266);
     }
 
+    /// M8: Anthropic prompt-cache hits must be excluded from prefill ratio.
+    /// chars / (input - cache_read) — not chars / input — so cache hits don't
+    /// pollute the chars-per-token estimate.
+    #[tokio::test]
+    async fn calibration_excludes_anthropic_cache_read_input_tokens() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        let info = SelectWorkerInfo {
+            program_id: Some("ant-cache"),
+            ..Default::default()
+        };
+        let _ = policy.select_worker_async(&workers, &info).await;
+        let tx = policy.usage_sender().expect("sender");
+        // Anthropic example: 300 input_tokens of which 250 are cache_read.
+        // Actual prefill = 50 fresh tokens. Request text was 200 chars.
+        // Ratio should be 200 / 50 = 4.0 (not 200 / 300 = 0.667).
+        tx.send(UsageEvent {
+            program_id: Some("ant-cache".to_string()),
+            backend_url: workers[0].url().to_string(),
+            prompt_tokens: 300,
+            completion_tokens: 20,
+            total_tokens: 320,
+            request_text_chars: 200,
+            cache_read_input_tokens: Some(250),
+            declared_max_tokens: None,
+        })
+        .expect("send");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snap = policy.snapshot_state().await;
+        let p = snap.programs.get("ant-cache").expect("program");
+        let ratio = p.local_char_to_token_ratio.unwrap();
+        assert!(
+            (ratio - 4.0).abs() < 1e-6,
+            "ratio must use actual_prefill (input - cache_read), got {ratio}"
+        );
+    }
+
     /// Calibration must update on UsageEvent reaching the consumer.
     #[tokio::test]
     async fn calibration_updates_on_usage_event() {

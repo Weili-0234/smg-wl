@@ -985,3 +985,13 @@ Program lifecycle state machine added: `ProgramStatus { Idle, Reasoning, Acting,
 **Cross-retry guard idempotency**: `ProgramRequestGuard` is created per-call to `route_typed_request_once`, but `route_typed_request_once` is the operation closure inside `RetryExecutor`. Each retry creates a new guard. This means in_flight could over-count across retries. Acceptable for first-pass since retries are rare and saturating_sub protects the floor; clean fix (one guard per retry-cycle) deferred to follow-up.
 
 **Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.7
+
+## D-36..D-37 (2026-05-01): Phase 7 M8 — Anthropic edge cases
+
+`<SIGNED-OFF>` Anthropic prompt-cache token semantics already wired by M3 — `usage_consumer_task` computes `actual_prefill = prompt_tokens - cache_read_input_tokens` and uses it in calibration ratio. This fixes a Python-side bug (Python's calibration treats cache hits as fresh prefill, inflating the chars-per-token ratio for cached requests).
+
+**D-36**: `cache_read_input_tokens` flows: Anthropic SSE parser extracts from `message_start.usage.cache_read_input_tokens` → `ParsedUsage.cached_tokens` → `UsageEvent.cache_read_input_tokens` → consumer's prefill calc. New unit test `calibration_excludes_anthropic_cache_read_input_tokens` validates: 200 chars / 50 actual prefill = 4.0 ratio (not 0.667 if it had used raw input_tokens=300).
+
+**D-37 (partial)**: Cross-protocol per-program calibration (`Program.local_char_to_token_ratio_by_protocol: HashMap<SseProtocol, f64>`) — deferred as Tier 2 polish. Current state: single `local_char_to_token_ratio` per program; if a program uses multiple protocols (rare in practice), the EMA tracks the mix. The neutral-fallback-on-decay behavior naturally handles drift if protocols change.
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.8
