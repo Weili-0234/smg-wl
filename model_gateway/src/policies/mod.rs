@@ -37,6 +37,32 @@ pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 
+/// Per-request usage event emitted by routers after the upstream stream completes.
+///
+/// Stateless policies ignore this; ThunderPolicy (Phase 3+) consumes it via the
+/// `usage_sender` channel to update `BackendState.active_program_tokens` and the
+/// per-program `char_to_token_ratio` calibration.
+///
+/// `request_text_chars` is captured by the router at admission time (length of
+/// the value returned by `GenerationRequest::extract_text_for_routing`) so the
+/// consumer can compute `tokens_per_char = total_tokens / request_text_chars`.
+#[derive(Debug, Clone)]
+pub struct UsageEvent {
+    /// Program identifier this usage belongs to (None for non-program requests
+    /// or when the client did not send `metadata.program_id`).
+    pub program_id: Option<String>,
+    /// Backend URL the request was routed to (matches `worker.url()`).
+    pub backend_url: String,
+    /// Prompt tokens reported by upstream usage payload.
+    pub prompt_tokens: u32,
+    /// Completion tokens reported by upstream usage payload.
+    pub completion_tokens: u32,
+    /// Sum of prompt + completion (kept explicit so consumers don't repeat the math).
+    pub total_tokens: u32,
+    /// Char-length of the routing-extracted request text (for char→token ratio calibration).
+    pub request_text_chars: usize,
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms
@@ -228,5 +254,19 @@ mod tests {
         workers[1].set_status(WorkerStatus::NotReady);
         let indices = get_healthy_worker_indices(&workers);
         assert_eq!(indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn usage_event_struct_exists_and_is_constructible() {
+        let ev = UsageEvent {
+            program_id: Some("p1".to_string()),
+            backend_url: "http://w1:8001".to_string(),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            request_text_chars: 400,
+        };
+        assert_eq!(ev.total_tokens, 150);
+        assert_eq!(ev.program_id.as_deref(), Some("p1"));
     }
 }
