@@ -41,6 +41,7 @@ use crate::{
     routers::{
         common::{
             header_utils,
+            program_id as common_program_id,
             retry::{is_retryable_status, RetryExecutor},
         },
         error::{self, extract_error_code_from_response},
@@ -138,11 +139,12 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
-    fn select_worker_for_model(
+    async fn select_worker_for_model(
         &self,
         model_id: &str,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
+        program_id: Option<&str>,
     ) -> Option<Arc<dyn Worker>> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
@@ -173,16 +175,18 @@ impl Router {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
-                headers,
-                hash_ring,
-                program_id: None,
-            },
-        )?;
+        let idx = policy
+            .select_worker_async(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    headers,
+                    hash_ring,
+                    program_id,
+                },
+            )
+            .await?;
 
         // Record worker selection metric (Layer 3)
         Metrics::record_worker_selection(
@@ -289,7 +293,15 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
+        let worker = match self
+            .select_worker_for_model(
+                model_id,
+                Some(text),
+                headers,
+                common_program_id::extract(typed_req),
+            )
+            .await
+        {
             Some(w) => w,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
