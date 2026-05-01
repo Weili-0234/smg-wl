@@ -386,4 +386,123 @@ mod tests {
         let stub = Stub;
         assert!(stub.usage_sender().is_none());
     }
+
+    /// Helper: build N healthy mock workers.
+    fn mock_workers(n: usize) -> Vec<Arc<dyn Worker>> {
+        (0..n)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                        .worker_type(WorkerType::Regular)
+                        .api_key("test")
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    /// Helper: assert sync and async selection give compatible results.
+    /// "Compatible" means either both return None, or both return Some(idx)
+    /// where idx is a valid index into workers. We don't require exact equality
+    /// because stateful and RNG-based policies may advance between calls.
+    async fn assert_parity(
+        policy: &dyn LoadBalancingPolicy,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) {
+        let sync = policy.select_worker(workers, info);
+        let asy = policy.select_worker_async(workers, info).await;
+        match (sync, asy) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                assert!(a < workers.len(), "sync idx out of range: {a}");
+                assert!(b < workers.len(), "async idx out of range: {b}");
+            }
+            (s, a) => panic!(
+                "policy {} parity violated: sync={:?} async={:?}",
+                policy.name(),
+                s,
+                a
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn round_robin_parity() {
+        let policy = RoundRobinPolicy::new();
+        let workers = mock_workers(3);
+        let info = SelectWorkerInfo::default();
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[tokio::test]
+    async fn random_parity() {
+        let policy = RandomPolicy::new();
+        let workers = mock_workers(3);
+        let info = SelectWorkerInfo::default();
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[tokio::test]
+    async fn power_of_two_parity() {
+        let policy = PowerOfTwoPolicy::new();
+        let workers = mock_workers(3);
+        let info = SelectWorkerInfo::default();
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[tokio::test]
+    async fn consistent_hashing_parity() {
+        let policy = ConsistentHashingPolicy::new();
+        let workers = mock_workers(3);
+        let info = SelectWorkerInfo::default();
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[tokio::test]
+    async fn cache_aware_parity() {
+        let policy = CacheAwarePolicy::new();
+        let workers = mock_workers(3);
+        let info = SelectWorkerInfo {
+            request_text: Some("hello world"),
+            ..Default::default()
+        };
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[tokio::test]
+    async fn bucket_parity() {
+        let policy = BucketPolicy::new();
+        let workers = mock_workers(3);
+        let info = SelectWorkerInfo::default();
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[tokio::test]
+    async fn prefix_hash_parity() {
+        let policy = PrefixHashPolicy::new(PrefixHashConfig::default());
+        let workers = mock_workers(3);
+        let tokens = [1, 2, 3];
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            ..Default::default()
+        };
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[tokio::test]
+    async fn manual_parity() {
+        let policy = ManualPolicy::new();
+        let workers = mock_workers(3);
+        let info = SelectWorkerInfo::default();
+        assert_parity(&policy, &workers, &info).await;
+    }
+
+    #[test]
+    fn minimum_tokens_policy_is_dp_rank_policy_only() {
+        let policy = MinimumTokensPolicy::new(None);
+        let workers = mock_workers(1);
+        assert!(policy.select_dp_rank(workers[0].as_ref(), 1).is_none());
+    }
 }
