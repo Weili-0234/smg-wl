@@ -21,7 +21,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
-    RwLock,
+    Notify, RwLock,
 };
 use tracing::{debug, trace, warn};
 
@@ -78,6 +78,11 @@ pub struct Program {
     pub total_tokens: u64,
     /// Step counter — increments per admission. (Not yet used in P3.)
     pub step_count: u32,
+    /// Tokens this program has *reserved* on its backend at admit-time
+    /// (TR sub-mode, P5+). Un-reserved by `usage_consumer` when the actual
+    /// `UsageEvent` arrives so capacity accounting stays consistent across
+    /// the request lifetime.
+    pub estimated_reserved_tokens: u64,
 }
 
 impl Program {
@@ -88,6 +93,7 @@ impl Program {
             in_flight: 0,
             total_tokens: 0,
             step_count: 0,
+            estimated_reserved_tokens: 0,
         }
     }
 }
@@ -118,6 +124,16 @@ impl BackendState {
 pub struct RouterState {
     pub programs: HashMap<String, Program>,
     pub backends: HashMap<String, BackendState>,
+    /// Per-program resume signals (TR sub-mode, P5+P6). Key: program_id;
+    /// value: `Notify` the scheduler / `usage_consumer` fires when backend
+    /// capacity frees so that paused requests can re-evaluate admission.
+    ///
+    /// Lifetime: a `Notify` is created on first pause and stays in the map
+    /// until the policy is dropped — leaking a few `Arc<Notify>` per
+    /// long-lived program is cheap (≤ tens of bytes each) and avoids any
+    /// race where a freshly-arriving second request mis-pairs with a
+    /// just-deleted handle. Re-cleanup deferred to P9 if it ever matters.
+    pub waiting_events: HashMap<String, Arc<Notify>>,
 }
 
 impl RouterState {
@@ -163,6 +179,39 @@ impl RouterState {
         program.step_count = program.step_count.saturating_add(1);
         let backend = self.backends.entry(backend_url.to_string()).or_default();
         backend.active_programs.insert(program_id.to_string());
+    }
+
+    /// Get-or-create the per-program `Notify` that paused requests await on.
+    /// (TR sub-mode, P5+P6.)
+    fn waiting_event_for(&mut self, program_id: &str) -> Arc<Notify> {
+        self.waiting_events
+            .entry(program_id.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
+    /// Returns `true` if `backend_url` has headroom to absorb
+    /// `estimated_tokens` more, considering the configured
+    /// `reserved_fraction` slack. Optimistic on unknown / not-yet-polled
+    /// backends so cold-start traffic isn't gated by missing capacity data.
+    fn has_capacity(
+        &self,
+        backend_url: &str,
+        estimated_tokens: u64,
+        reserved_fraction: f64,
+    ) -> bool {
+        let Some(b) = self.backends.get(backend_url) else {
+            return true; // unknown backend → optimistic admit
+        };
+        if b.capacity_tokens == 0 {
+            return true; // not yet polled → optimistic admit (warmup)
+        }
+        // Saturating math: `reserved_fraction` is validated to [0.0,1.0] in
+        // config, but the cast to u64 still rounds down so the bound is
+        // conservative.
+        let usable_f = (b.capacity_tokens as f64) * (1.0 - reserved_fraction).max(0.0);
+        let usable = usable_f as u64;
+        b.active_program_tokens.saturating_add(estimated_tokens) <= usable
     }
 }
 
@@ -315,6 +364,10 @@ impl ThunderPolicy {
         RouterState {
             programs: guard.programs.clone(),
             backends: guard.backends.clone(),
+            // `Arc<Notify>` clone is a refcount bump — cheap. Snapshots
+            // shouldn't usually inspect Notify identity but cloning keeps
+            // the type symmetric.
+            waiting_events: guard.waiting_events.clone(),
         }
     }
 }
