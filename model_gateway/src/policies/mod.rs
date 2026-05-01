@@ -204,6 +204,11 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// Program identifier extracted from the request body (typically from
+    /// `metadata.program_id` for Anthropic Messages requests). Read by
+    /// program-aware policies (Thunder) for capacity tracking. Default None
+    /// keeps existing policies' behavior unchanged.
+    pub program_id: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -268,5 +273,24 @@ mod tests {
         };
         assert_eq!(ev.total_tokens, 150);
         assert_eq!(ev.program_id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn select_worker_info_carries_program_id() {
+        let pid = "agent-step-7";
+        let info = SelectWorkerInfo {
+            request_text: Some("hello"),
+            tokens: None,
+            headers: None,
+            hash_ring: None,
+            program_id: Some(pid),
+        };
+        assert_eq!(info.program_id, Some("agent-step-7"));
+    }
+
+    #[test]
+    fn select_worker_info_default_program_id_is_none() {
+        let info = SelectWorkerInfo::default();
+        assert_eq!(info.program_id, None);
     }
 }

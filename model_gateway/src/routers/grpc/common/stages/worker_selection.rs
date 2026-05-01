@@ -161,6 +161,7 @@ impl WorkerSelectionStage {
                 tokens,
                 headers,
                 hash_ring,
+                program_id: None,
             },
         )?;
         let selected = available[idx].clone();
@@ -272,6 +273,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             hash_ring,
+            program_id: None,
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info)?;
         let decode_idx = policy.select_worker(&available_decode, &info)?;
