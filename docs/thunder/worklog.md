@@ -421,3 +421,46 @@ Weili Xu, 2026-04-30 session ("好，就用 Option α").
 ### Approved by
 
 (Pending P0 implementation commit + user review.)
+
+---
+
+## D-17: P1 implementation completed — LoadBalancingPolicy trait extension landed
+
+**Date**: 2026-05-01
+**Spec ref**: `docs/thunder/10-phases.md` P1 row, `docs/thunder/04-smg-integration.md` §5.5b/§5.7
+
+### What landed
+
+- `UsageEvent` struct in `model_gateway/src/policies/mod.rs`
+- `SelectWorkerInfo.program_id: Option<&'a str>` field in same file
+- `#[async_trait]` on `LoadBalancingPolicy` trait + `async fn select_worker_async` default impl + `fn usage_sender` default-None
+- New `model_gateway/src/routers/common/program_id.rs` helper module
+- Async migration: `routers/http/router.rs::select_worker_for_model` + `routers/grpc/common/stages/worker_selection.rs::select_single_worker`
+- 8 per-policy parity tests asserting `select_worker == select_worker_async` for bucket, cache_aware, consistent_hashing, manual, power_of_two, prefix_hash, random, round_robin
+- `MinimumTokensPolicy` guard confirming it remains a `DPRankLoadPolicy`-only policy, not a `LoadBalancingPolicy`
+- Phase 0 e2e regression: 3/3 still pass
+
+### What did NOT change
+
+- Zero individual policy implementation files modified (`bucket.rs` ... `round_robin.rs` untouched)
+- PD path (`routers/grpc/common/stages/worker_selection.rs::select_pd_pair`) deliberately not migrated — PD scope is deferred beyond P1
+- `routers/anthropic/`, `routers/openai/`, `routers/gemini/` — 3rd-party path, out of scope
+- PD routers were not behaviorally changed; `routers/http/pd_router.rs` only received the required `program_id: None` field default after `SelectWorkerInfo` grew a public field
+- `policies/thunder.rs` — does not exist; arrives in P3
+- CLI / config / observability / worker / e2e — out of scope
+
+### Footguns surfaced
+
+1. Adding a public field to `SelectWorkerInfo` required updating all struct literals, including a compile-only `program_id: None` default in `routers/http/pd_router.rs`. This did not change PD behavior, but it did touch a file listed as out of scope for behavioral work.
+2. The plan listed `dp_min_token` in the parity sweep, but `MinimumTokensPolicy` implements `DPRankLoadPolicy`, not `LoadBalancingPolicy`. P1 kept that production boundary intact and added a dp-rank-only guard instead of a misleading fallback parity test.
+3. Clippy flagged fully-qualified `tokio::sync::mpsc::UnboundedSender` usage in the trait default; importing `UnboundedSender` directly keeps the trait extension warning-free under `-D warnings`.
+
+### Revisit conditions
+
+1. If P3 adds a policy that needs async work in selection AND that policy is in the PD path, the deferral above must be reconsidered — the PD `select_pd_pair` will need its own async migration.
+2. If `usage_sender` design proves insufficient (e.g., backpressure issues from unbounded channel under high load), revisit channel type — possibly switch to bounded with `try_send` + drop-on-full semantics.
+3. If `program_id_hint` becomes performance-critical (millions of QPS), benchmark the `as_deref()` chain in `Metadata` lookup; today it's negligible.
+
+### Approved by
+
+(Pending P1 implementation commit + Claude review + user sign-off.)
