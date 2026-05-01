@@ -212,33 +212,51 @@ Use `program.char_to_token_ratio` in `estimate_request_tokens` if program exists
 
 ## Classification summary
 
-| Gap | Type | Runs? | Faithful to ThunderAgent semantics? | Severity | Repair LOC |
-|---|---|---|---|---|---|
-| 1. No proactive pause | **algorithm** | yes | ❌ major | high | ~100 |
-| 2. No victim selection | **algorithm** | yes | ❌ major | high | ~150 |
-| 3. BFD → least-active | **algorithm** | yes | ⚠️ observable | medium | ~150 |
-| 4. Broadcast vs targeted Notify | engineering | yes | ✅ equivalent | low | ~30 |
-| 5. RAII guard incomplete | **bug** | yes (short-term) | ❌ capacity leak | **production-blocker** | ~30 |
-| 6. Streaming bypasses state | engineering+algorithm | yes | ❌ breaks under streaming | high (user's primary use case) | ~280 |
-| 7. Token estimate uncalibrated | engineering | yes | ⚠️ rough | medium | ~40 |
+> **Phase 7 status (2026-05-01)**: All 7 gaps closed across 8 milestones (commits `51fd6951`..`23390276`). See `docs/thunder/worklog.md` D-23..D-37 for detailed sign-off.
+
+| Gap | Type | Resolved? | Closed by | LOC actual |
+|---|---|---|---|---|
+| 1. No proactive pause | **algorithm** | ✅ | M4 (`d3e7b091`) | ~250 |
+| 2. No victim selection | **algorithm** | ✅ | M4 (`d3e7b091`) | (paired with 1) |
+| 3. BFD → least-active | **algorithm** | ✅ | M5 (`71fe9614`) | ~200 |
+| 4. Broadcast vs targeted Notify | engineering | ✅ | M6 (`71fe9614`) | ~40 |
+| 5. RAII guard incomplete | **bug** | ✅ | M1 (`51fd6951`) | ~30 |
+| 6. Streaming bypasses state | engineering+algorithm | ✅ | M2 (`7c6b5960`) | ~390 |
+| 7. Token estimate uncalibrated | engineering | ✅ | M3 (`c100975c`) | ~90 |
 
 ---
 
 ## What SMG Thunder can/cannot legitimately claim
 
+> **Post-Phase 7** (2026-05-01): all rows flipped to ✅ via M1-M8.
+
 | Claim | Truth status |
 |---|---|
-| Implements ThunderAgent algorithm | ❌ — simplified port; gaps 1, 2, 3 |
+| Implements ThunderAgent algorithm | ✅ (with 9 documented intentional divergences below) |
 | program-aware sticky routing | ✅ |
 | capacity-aware admission gate (non-streaming) | ✅ |
-| capacity-aware admission gate (streaming) | ❌ — gap 6 |
-| pause/resume on capacity full | ⚠️ partial — admit-time only; no proactive pause (gap 1) |
-| BFD greedy_resume bin-packing | ❌ — uses least-active (gap 3) |
+| capacity-aware admission gate (streaming) | ✅ (M2) |
+| pause/resume on capacity full | ✅ (M4 proactive + scheduler tick @ 100ms) |
+| BFD greedy_resume bin-packing | ✅ (M5 with starvation priority boost) |
 | force-resume timeout | ✅ |
-| RAII cleanup on client disconnect | ❌ — capacity leak bug (gap 5) |
-| streaming token tracking | ❌ — gap 6 |
-| char_to_token_ratio calibration | ❌ — gap 7 |
-| streaming requests participate in scheduling | ❌ — gap 6 |
+| RAII cleanup on client disconnect | ✅ (M1 fix) |
+| streaming token tracking | ✅ (M2 incremental + end-of-stream) |
+| char_to_token_ratio calibration | ✅ (M3 per-program + global + time-decay + cache_read exclusion) |
+| streaming requests participate in scheduling | ✅ (M2) |
+
+## Intentional SMG ↔ Python divergences (Phase 7)
+
+| # | Dimension | Python | SMG | Type |
+|---|---|---|---|---|
+| 1 | `include_usage` injection on OpenAI Chat | setdefault (preserves user) | force override | UX choice |
+| 2 | response usage chunk visibility | unconditionally forwarded | stripped if client didn't ask | client transparency |
+| 3 | Anthropic incremental token counting | event-count (inaccurate) | cumulative output_tokens (accurate) | **fixes Python bug** |
+| 4 | Per-program calibration | not present | global + per-program two-tier | enhancement |
+| 5 | Completion budget calibration | not present | per-program EMA on completion/max_tokens | enhancement |
+| 6 | Time-decay on calibration | event-EMA only | event-EMA + wall-time half-life decay | enhancement |
+| 7 | Anthropic cache_read_input_tokens | not handled (treated as fresh) | excluded from prefill ratio | **fixes Python bug** |
+| 8 | Cross-protocol per-program calibration | not present | single ratio per program (per-protocol HashMap deferred to Tier 2) | partial enhancement |
+| 9 | Streaming retry boundary | implicit | strict 200 OK divides retry from no-retry | enhancement |
 
 ---
 
