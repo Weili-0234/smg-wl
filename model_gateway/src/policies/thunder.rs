@@ -18,7 +18,12 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use async_trait::async_trait;
 use tokio::sync::RwLock;
+use tracing::{debug, trace, warn};
+
+use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use crate::worker::Worker;
 
 /// Sub-mode selector. Phase 3 only implements `Default`. `Tr` (transactional)
 /// arrives in Phase 5 with capacity-gated admission; until then Tr falls back
@@ -69,7 +74,6 @@ pub struct Program {
 }
 
 impl Program {
-    #[allow(dead_code)]
     fn new(program_id: String) -> Self {
         Self {
             program_id,
@@ -93,7 +97,6 @@ pub struct BackendState {
 }
 
 impl BackendState {
-    #[allow(dead_code)]
     fn active_count(&self) -> usize {
         self.active_programs.len()
     }
@@ -114,7 +117,6 @@ impl RouterState {
     /// Ensure backends map is populated for the given URL set, removing
     /// entries no longer present. Called on every selection — cheap because
     /// HashMap ops are O(1) and the set is tiny (≤ tens of backends).
-    #[allow(dead_code)]
     fn refresh_backends(&mut self, urls: &[String]) {
         for url in urls {
             self.backends.entry(url.clone()).or_default();
@@ -125,7 +127,6 @@ impl RouterState {
 
     /// Default-mode selection: pick the backend whose active_program count is
     /// smallest. Ties broken by URL string ordering (deterministic).
-    #[allow(dead_code)]
     fn select_least_active(&self, urls: &[String]) -> Option<String> {
         urls.iter()
             .min_by(|a, b| {
@@ -145,7 +146,6 @@ impl RouterState {
     }
 
     /// Record (or refresh) the program → backend assignment.
-    #[allow(dead_code)]
     fn assign(&mut self, program_id: &str, backend_url: &str) {
         let program = self
             .programs
@@ -163,7 +163,6 @@ impl RouterState {
 /// `Arc<dyn LoadBalancingPolicy>`.
 #[derive(Debug)]
 pub struct ThunderPolicy {
-    #[allow(dead_code)]
     config: ThunderConfig,
     state: Arc<RwLock<RouterState>>,
 }
@@ -182,12 +181,195 @@ impl ThunderPolicy {
 
     /// Test/admin accessor — clones the current state for read-only inspection.
     /// (Used by Phase 8's `/thunder/programs` admin endpoint when it lands.)
-    #[allow(dead_code)]
     pub async fn snapshot_state(&self) -> RouterState {
         let guard = self.state.read().await;
         RouterState {
             programs: guard.programs.clone(),
             backends: guard.backends.clone(),
         }
+    }
+}
+
+#[async_trait]
+impl LoadBalancingPolicy for ThunderPolicy {
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        // Sync path: use blocking_write. Only safe outside an async context (it
+        // panics if called from inside a tokio runtime). The canonical entry
+        // point is `select_worker_async`; this exists for trait-object
+        // completeness + the per-policy parity tests added in Phase 1.
+        let mut state = self.state.blocking_write();
+        Self::pick_default_inner(&mut state, workers, info, self.config.sub_mode)
+    }
+
+    async fn select_worker_async(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        let mut state = self.state.write().await;
+        Self::pick_default_inner(&mut state, workers, info, self.config.sub_mode)
+    }
+
+    fn name(&self) -> &'static str {
+        "thunder"
+    }
+
+    fn needs_request_text(&self) -> bool {
+        // Default mode does not consult cache; TR mode (P5+) may. Keep false
+        // for now to skip request_text extraction in routers.
+        false
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl ThunderPolicy {
+    /// Inner helper called by both sync and async select paths.
+    fn pick_default_inner(
+        state: &mut RouterState,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo,
+        sub_mode: ThunderSubMode,
+    ) -> Option<usize> {
+        if workers.is_empty() {
+            return None;
+        }
+
+        // Refresh backend index from current worker set
+        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        state.refresh_backends(&urls);
+
+        // Q5.2 fallback: missing program_id resolves to a "default" pseudo-program
+        let program_id = info.program_id.unwrap_or("default");
+
+        // Sticky routing: if program already has a backend and that backend is
+        // still in the available worker list, reuse it.
+        if let Some(existing_url) = state
+            .programs
+            .get(program_id)
+            .and_then(|p| p.backend_url.as_ref())
+            .cloned()
+        {
+            if let Some(idx) = workers.iter().position(|w| w.url() == existing_url) {
+                state.assign(program_id, &existing_url);
+                trace!(program_id = %program_id, backend = %existing_url, "thunder sticky route");
+                return Some(idx);
+            }
+        }
+
+        match sub_mode {
+            ThunderSubMode::Default => {
+                let chosen_url = state.select_least_active(&urls)?;
+                let idx = workers.iter().position(|w| w.url() == chosen_url)?;
+                state.assign(program_id, &chosen_url);
+                debug!(
+                    program_id = %program_id,
+                    backend = %chosen_url,
+                    active_count = state.backends.get(&chosen_url).map(|s| s.active_count()).unwrap_or(0),
+                    "thunder default-mode select"
+                );
+                Some(idx)
+            }
+            ThunderSubMode::Tr => {
+                // P5 will wire capacity-gated admission. Fall back to Default
+                // for now so traffic still flows during partial roll-out.
+                warn!(
+                    "ThunderSubMode::Tr selected but capacity gate not wired (P5); \
+                     falling back to Default"
+                );
+                let chosen_url = state.select_least_active(&urls)?;
+                let idx = workers.iter().position(|w| w.url() == chosen_url)?;
+                state.assign(program_id, &chosen_url);
+                Some(idx)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::worker::HealthCheckConfig;
+
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+    fn no_health_check() -> HealthCheckConfig {
+        HealthCheckConfig {
+            disable_health_check: true,
+            ..Default::default()
+        }
+    }
+
+    fn mock_workers(n: usize) -> Vec<Arc<dyn Worker>> {
+        (0..n)
+            .map(|i| {
+                Arc::new(
+                    BasicWorkerBuilder::new(format!("http://w{i}:8000"))
+                        .worker_type(WorkerType::Regular)
+                        .api_key("test")
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn default_mode_picks_least_active() {
+        let policy = ThunderPolicy::with_defaults();
+        let workers = mock_workers(3);
+        // Two requests with different program_ids → should land on different backends
+        // (least-active starts at 0 for each, so picks w0 then w1 by deterministic tiebreak).
+        let info1 = SelectWorkerInfo {
+            program_id: Some("p1"),
+            ..Default::default()
+        };
+        let info2 = SelectWorkerInfo {
+            program_id: Some("p2"),
+            ..Default::default()
+        };
+        let i1 = policy.select_worker_async(&workers, &info1).await;
+        let i2 = policy.select_worker_async(&workers, &info2).await;
+        assert!(i1.is_some());
+        assert!(i2.is_some());
+        // Sticky: same program goes to same backend
+        let i1_again = policy.select_worker_async(&workers, &info1).await;
+        assert_eq!(i1, i1_again, "thunder must be sticky on program_id");
+    }
+
+    #[tokio::test]
+    async fn missing_program_id_falls_back_to_default_key() {
+        let policy = ThunderPolicy::with_defaults();
+        let workers = mock_workers(2);
+        let info = SelectWorkerInfo::default(); // program_id = None
+        let i1 = policy.select_worker_async(&workers, &info).await;
+        let i2 = policy.select_worker_async(&workers, &info).await;
+        // Both hit the "default" pseudo-program → sticky to same backend
+        assert_eq!(i1, i2);
+    }
+
+    #[tokio::test]
+    async fn empty_worker_set_returns_none() {
+        let policy = ThunderPolicy::with_defaults();
+        let info = SelectWorkerInfo::default();
+        assert_eq!(policy.select_worker_async(&[], &info).await, None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_state_after_routes() {
+        let policy = ThunderPolicy::with_defaults();
+        let workers = mock_workers(2);
+        let info = SelectWorkerInfo {
+            program_id: Some("snap-test"),
+            ..Default::default()
+        };
+        let _ = policy.select_worker_async(&workers, &info).await;
+        let state = policy.snapshot_state().await;
+        assert!(state.programs.contains_key("snap-test"));
+        let prog = &state.programs["snap-test"];
+        assert!(prog.backend_url.is_some());
+        assert_eq!(prog.step_count, 1);
     }
 }
