@@ -728,3 +728,179 @@ the workspace; 10/10 thunder e2e tests pass (P0 + P2 + P3 regression).
 
 (Pending Claude review + user sign-off.)
 
+---
+
+## D-21: P5+P6 implementation completed — capacity gate + simple pause/resume
+
+Closed plan: `docs/superpowers/plans/2026-05-01-thunder-p5p6-capacity-pause-resume.md`.
+
+### What landed
+
+1. **`RouterState.waiting_events: HashMap<String, Arc<Notify>>`**
+   plus helpers `waiting_event_for(pid)` and
+   `has_capacity(url, est, reserved_fraction)`. The Notify map is
+   lazily populated and never reclaimed (cheap; revisit P9).
+2. **`Program.estimated_reserved_tokens: u64`** so usage_consumer can
+   un-reserve admit-time estimates when the actual UsageEvent arrives.
+3. **TR sub-mode admission gate** in `ThunderPolicy::pick_tr`. Loop:
+   try-admit (sticky → least-active → has_capacity check) → register
+   per-program Notify → drop lock → await with `tokio::time::timeout` →
+   on wake re-evaluate; on deadline fall through to
+   `force_admit_after_timeout` (skip capacity check).
+4. **Tokens reserved at admit-time** on the chosen backend so a herd
+   of arrivals doesn't all see the same headroom and double-admit.
+5. **`usage_consumer` un-reserves + broadcasts**. After applying each
+   `UsageEvent` the consumer subtracts `Program.estimated_reserved_tokens`
+   from `BackendState.active_program_tokens`, adds the actual usage,
+   clears the reservation, then broadcasts `Notify::notify_waiters`
+   to every paused program so they can re-check.
+6. **`ProgramRequestGuard`** RAII held by `route_typed_request_once`.
+   On `Drop` (cancel / error / dropped future) it spawns an async
+   cleanup task that decrements `Program.in_flight` and broadcasts
+   waiting Notifies. `complete()` suppresses cleanup on the happy
+   non-streaming success path where `usage_consumer` already
+   decremented `in_flight`.
+7. **Wire-up in `routers/http/router.rs::route_typed_request_once`**
+   via `policy.as_any().downcast_ref::<ThunderPolicy>()` — zero cost
+   for non-Thunder policies.
+8. **e2e test** `test_phase5p6_capacity_pause_resume.py` (2 tests).
+
+5 feature commits on `thunder-policy-p5p6`:
+  c887a3e1 RouterState waiting_events + has_capacity helper
+  41bdc0bb TR sub-mode capacity-aware admission with Notify wait
+  0ec7acea usage_consumer un-reserves + broadcasts Notify
+  42ede617 ProgramRequestGuard RAII
+  6c7474db Phase 5+6 e2e + clippy clean
+
+### What did NOT change (deferred per autonomous trim)
+
+1. **BFD greedy_resume optimal bin-packing** — explicit D-22
+   simplification. ~150 LOC faithful Python port deferred to P9 polish
+   or post-MVP iteration. Current behavior: simple "wake all → each
+   re-checks → either admits or re-pauses" loop.
+2. **`mark_for_pause` for in-flight ACTING programs** — only meaningful
+   when BFD is choosing victims; in our simple model, only
+   newly-arriving requests block. D-22 explicit.
+3. **Streaming SSE branches** in `routers/http/router.rs` — out of
+   scope, noted as constraint.
+4. **`force_terminate_program` handshake** in `ProgramRequestGuard`
+   (D-9 Option C+C1 retry-aware idempotency). Guard simplified to
+   plain in_flight decrement on Drop.
+5. **`char_to_token_ratio` momentum (Q5.5)** — deferred to P9. Current
+   estimate is a fixed `chars/4 + 256`. The
+   `estimate_request_tokens(&self, ...)` signature is intentionally
+   kept as a method (with `#[expect(unused_self)]`) so P9 can wire in
+   per-program calibration without changing call sites.
+
+### Autonomous decisions made (require user review)
+
+1. **D-21 / D-22 — Combined P5+P6 + simplified pause/resume.** P5
+   alone (just 503 on capacity-full) provides no user value. The
+   differentiator is pause-then-resume which is P6. Combined into one
+   phase for shippable value. Simplified naive "block on full / wake
+   on free" semantics — correctness > optimality for first working
+   version. ★
+
+2. **Dispatch split: Default fast-path single-locked vs TR multi-await
+   loop.** Default mode keeps a single `RwLock::write().await` →
+   `pick_default_inner` for minimal overhead and no awaits in the
+   critical section. TR mode owns its own lock acquisition pattern
+   in `pick_tr` (acquire → try-admit → drop → await Notify → loop).
+   The sync `select_worker` path can't `await` on Notify, so TR
+   degrades-with-warn to least-active there (preserves trait-object
+   completeness). ★
+
+3. **Broadcast wake (vs targeted-by-backend).** When usage_consumer
+   or `ProgramRequestGuard::Drop` fires, we wake EVERY currently-paused
+   program rather than only those waiting on the freed backend.
+   Simpler. Re-evaluation under the lock filters non-applicable wakes
+   immediately. Backend count is bounded (≤ tens); thundering herd is
+   small. Optimization deferred to P9. ★
+
+4. **Tokens reserved at admit-time** on the chosen backend
+   (`estimated_reserved_tokens`) and un-reserved by usage_consumer
+   when the actual `UsageEvent` arrives. This avoids the herd race
+   where N concurrent arrivals all read the same
+   `active_program_tokens` and all admit. Default mode is unchanged
+   because it never sets `estimated_reserved_tokens` (the un-reserve
+   subtracts 0). ★
+
+5. **`Drop` for ProgramRequestGuard spawns async cleanup.** `Drop`
+   is sync but the `RouterState` lock is async, so we `tokio::spawn`
+   an async task that captures `Weak<RwLock<RouterState>>`. If the
+   policy was dropped first, `upgrade()` returns `None` and the task
+   exits. Same pattern as the existing capacity-poll / usage-consumer
+   tasks. ★
+
+6. **Token estimation: `chars/4 + 256`.** Conservative heuristic per
+   D-22. The 4-chars/token rule is a well-known English-text rule of
+   thumb; 256 is a common default `max_tokens` ceiling used by many
+   client libraries. P9 will wire per-program `char_to_token_ratio`
+   momentum and replace the fixed denominator. ★
+
+7. **Force-admit-after-timeout fallback.** When the
+   `--thunder-resume-timeout-secs` deadline (default 1800s) expires
+   without any capacity-free signal, `pick_tr` calls
+   `force_admit_after_timeout` which assigns the program to the
+   least-active backend regardless of capacity (still reserves the
+   estimate). This is the safety valve from §4.7 of the algorithm
+   doc — better to over-commit than to hang the request forever. ★
+
+8. **Test design: 1-block capacity + warmup primer (vs
+   `num_blocks=0`).** The plan's literal "set capacity to 0 → request
+   blocks" doesn't work because `has_capacity` treats
+   `capacity_tokens == 0` as "backend not yet polled → optimistic
+   admit". We instead use 1 block (16 tokens, ~14 usable after 0.10
+   reserved fraction) and a warmup primer to seed
+   `RouterState.backends` so the capacity-poll task can refresh it.
+   The test docstring spells this out. ★
+
+### Footguns surfaced
+
+1. **`capacity_tokens == 0` is overloaded.** It currently means both
+   "never polled" AND "polled and got 0". We chose "optimistic admit"
+   semantics for both. If a real backend with literal-zero capacity
+   ever arrives, requests will not be gated. Mitigation: introduce
+   `Option<u64>` or a separate `polled: bool` field if/when this
+   matters. Documented in test docstring.
+2. **`waiting_events` map grows unboundedly.** A long-running gateway
+   that handles many distinct program_ids accumulates one
+   `Arc<Notify>` per pid and never reclaims. Each is small (tens of
+   bytes), but a pathological client generating millions of unique
+   pids over weeks could leak memory. Cleanup deferred to P9.
+3. **Broadcast wake is O(programs) per UsageEvent.** Every request
+   completion wakes every paused program. Bounded by typical paused
+   count which is small in practice but could spike under a backend
+   outage. P9 may add per-backend Notify lists for targeted wake.
+4. **`ProgramRequestGuard::Drop` spawns a tokio task per cancel.**
+   If millions of requests are cancelled concurrently, the spawn
+   surge could pressure the runtime. In practice cancellation is
+   rare; accept for now.
+
+### Revisit conditions
+
+1. If a backend in production really does report 0 capacity (e.g.,
+   on load-shed) → tighten `has_capacity` semantics with
+   `Option`/`polled`.
+2. If we observe pause→resume thrashing under high load → switch to
+   per-backend Notify lists for targeted wake.
+3. If the 30-min force-resume timeout is hit in production with any
+   regularity → indicates the BFD greedy_resume layer is needed.
+   Promote P9 work.
+4. When P9 wires `char_to_token_ratio` momentum →
+   `estimate_request_tokens` already accepts `&self`; just reach
+   `self.state` for per-program ratios.
+
+### Verification
+
+- `cargo build --workspace`: green.
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean
+  (workspace-wide).
+- `cargo test -p smg policies::thunder`: 18/18 pass (10 prior + 8
+  new TR-mode + guard tests).
+- `pytest e2e_test/thunder/ -v`: 12/12 pass (10 prior + 2 P5+P6).
+
+### Approved by
+
+(Pending Claude review + user sign-off.)
+
