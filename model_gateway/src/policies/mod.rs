@@ -40,7 +40,7 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
-pub use thunder::ThunderPolicy;
+pub use thunder::{ProgramRequestGuard, ThunderPolicy};
 pub use thunder_metrics::{BackendCapacity, HttpMetricsClient, MetricsClient};
 
 /// Per-request usage event emitted by routers after the upstream stream completes.
@@ -67,6 +67,19 @@ pub struct UsageEvent {
     pub total_tokens: u32,
     /// Char-length of the routing-extracted request text (for char→token ratio calibration).
     pub request_text_chars: usize,
+    /// Anthropic-only: tokens served from prompt cache (excluded from prefill ratio in M3).
+    /// `None` for OpenAI Chat / Responses where this concept doesn't exist.
+    pub cache_read_input_tokens: Option<u32>,
+}
+
+/// Per-progress event emitted during streaming (every ~20 tokens or per Anthropic
+/// `message_delta`). ThunderPolicy consumes this via `streaming_progress_sender`
+/// to update `Program.total_tokens` incrementally — mirrors Python's
+/// `update_program_tokens_streaming`.
+#[derive(Debug, Clone)]
+pub struct StreamingProgressEvent {
+    pub program_id: String,
+    pub delta_tokens: u64,
 }
 
 /// Core trait for load balancing policies
@@ -149,6 +162,14 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// `Some(&self.usage_tx)` so it can update `BackendState.active_program_tokens`
     /// and per-program `char_to_token_ratio`.
     fn usage_sender(&self) -> Option<&UnboundedSender<UsageEvent>> {
+        None
+    }
+
+    /// Optional incremental streaming-progress sender. ThunderPolicy returns
+    /// `Some(&self.progress_tx)` so streaming relays can emit per-chunk token
+    /// deltas without grabbing the RouterState write lock on the hot path.
+    /// Mirrors `usage_sender` precedent (P1).
+    fn streaming_progress_sender(&self) -> Option<&UnboundedSender<StreamingProgressEvent>> {
         None
     }
 }
@@ -306,6 +327,7 @@ mod tests {
             completion_tokens: 50,
             total_tokens: 150,
             request_text_chars: 400,
+            cache_read_input_tokens: None,
         };
         assert_eq!(ev.total_tokens, 150);
         assert_eq!(ev.program_id.as_deref(), Some("p1"));

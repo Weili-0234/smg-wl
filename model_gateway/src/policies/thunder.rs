@@ -25,7 +25,9 @@ use tokio::sync::{
 };
 use tracing::{debug, trace, warn};
 
-use super::{thunder_metrics, LoadBalancingPolicy, SelectWorkerInfo, UsageEvent};
+use super::{
+    thunder_metrics, LoadBalancingPolicy, SelectWorkerInfo, StreamingProgressEvent, UsageEvent,
+};
 use crate::worker::Worker;
 
 /// Sub-mode selector. Phase 3 only implements `Default`. `Tr` (transactional)
@@ -235,6 +237,11 @@ pub struct ThunderPolicy {
     /// consumer task spawned in `with_metrics_client` updates per-program +
     /// per-backend token totals.
     usage_tx: UnboundedSender<UsageEvent>,
+    /// Sender side of the streaming-progress channel (M2). Routers emit
+    /// `StreamingProgressEvent` per ~20 tokens during streaming; the
+    /// consumer task drains and increments `Program.total_tokens`. Mirrors
+    /// `usage_tx` precedent.
+    progress_tx: UnboundedSender<StreamingProgressEvent>,
 }
 
 impl ThunderPolicy {
@@ -379,11 +386,43 @@ impl ThunderPolicy {
             debug!("usage_consumer channel closed; task exiting");
         });
 
+        // ----- progress_consumer task (M2 incremental streaming tokens) -----
+        // Mirrors usage_consumer: unbounded channel; fire-and-forget receiver
+        // updates only `Program.total_tokens` (NOT `backend.active_program_tokens`,
+        // matching Python's two-layer model where backend stats are computed
+        // from program totals at observation time, not maintained incrementally).
+        let (progress_tx, mut progress_rx) = unbounded_channel::<StreamingProgressEvent>();
+        let state_for_progress = Arc::downgrade(&state);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fire-and-forget progress consumer — exits when channel closes (policy dropped)"
+        )]
+        tokio::spawn(async move {
+            while let Some(event) = progress_rx.recv().await {
+                let Some(state_arc) = state_for_progress.upgrade() else {
+                    debug!("ThunderPolicy state dropped; progress consumer exiting");
+                    return;
+                };
+                let mut guard = state_arc.write().await;
+                if let Some(p) = guard.programs.get_mut(&event.program_id) {
+                    p.total_tokens = p.total_tokens.saturating_add(event.delta_tokens);
+                    trace!(
+                        program_id = %event.program_id,
+                        delta = event.delta_tokens,
+                        cumulative = p.total_tokens,
+                        "incremental streaming progress applied"
+                    );
+                }
+            }
+            debug!("progress_consumer channel closed; task exiting");
+        });
+
         Self {
             config,
             state,
             metrics_client,
             usage_tx,
+            progress_tx,
         }
     }
 
@@ -569,6 +608,10 @@ impl LoadBalancingPolicy for ThunderPolicy {
     /// per-program + per-backend token counters.
     fn usage_sender(&self) -> Option<&UnboundedSender<UsageEvent>> {
         Some(&self.usage_tx)
+    }
+
+    fn streaming_progress_sender(&self) -> Option<&UnboundedSender<StreamingProgressEvent>> {
+        Some(&self.progress_tx)
     }
 }
 
@@ -938,6 +981,7 @@ mod tests {
             completion_tokens: 30,
             total_tokens: 80,
             request_text_chars: 200,
+            cache_read_input_tokens: None,
         })
         .expect("send must succeed (consumer alive)");
 
@@ -984,6 +1028,7 @@ mod tests {
             completion_tokens: 2,
             total_tokens: 3,
             request_text_chars: 0,
+            cache_read_input_tokens: None,
         })
         .expect("send");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1102,6 +1147,7 @@ mod tests {
             completion_tokens: 40,
             total_tokens: 100,
             request_text_chars: 40,
+            cache_read_input_tokens: None,
         })
         .expect("send");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1203,6 +1249,7 @@ mod tests {
             completion_tokens: 0,
             total_tokens: 0,
             request_text_chars: 0,
+            cache_read_input_tokens: None,
         })
         .expect("send");
 
@@ -1324,6 +1371,65 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "force-admit should not wait significantly past timeout (took {elapsed:?})"
         );
+    }
+
+    /// M2: progress_consumer_task drains StreamingProgressEvent and updates
+    /// Program.total_tokens incrementally (Python parity for
+    /// update_program_tokens_streaming).
+    #[tokio::test]
+    async fn streaming_progress_increments_program_total_tokens() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        let info = SelectWorkerInfo {
+            program_id: Some("prog-stream"),
+            ..Default::default()
+        };
+        let _ = policy.select_worker_async(&workers, &info).await;
+
+        let tx = policy
+            .streaming_progress_sender()
+            .expect("ThunderPolicy must expose a streaming progress sender");
+        tx.send(StreamingProgressEvent {
+            program_id: "prog-stream".to_string(),
+            delta_tokens: 20,
+        })
+        .expect("send must succeed (consumer alive)");
+        tx.send(StreamingProgressEvent {
+            program_id: "prog-stream".to_string(),
+            delta_tokens: 20,
+        })
+        .expect("send must succeed");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let state = policy.snapshot_state().await;
+        let prog = state
+            .programs
+            .get("prog-stream")
+            .expect("program present after select");
+        assert_eq!(
+            prog.total_tokens, 40,
+            "two progress events of 20 each must accumulate"
+        );
+    }
+
+    /// M2: progress events for unknown programs must not panic (defensive).
+    #[tokio::test]
+    async fn streaming_progress_for_missing_program_is_no_op() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let tx = policy.streaming_progress_sender().expect("sender");
+        tx.send(StreamingProgressEvent {
+            program_id: "non-existent".to_string(),
+            delta_tokens: 100,
+        })
+        .expect("send");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Just survive without panic.
     }
 
     /// M1: Drop fallback must un-reserve estimated_reserved_tokens from

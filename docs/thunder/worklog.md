@@ -917,3 +917,22 @@ Closed plan: `docs/superpowers/plans/2026-05-01-thunder-p5p6-capacity-pause-resu
 
 **Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.1
 **Plan**: docs/superpowers/plans/2026-05-01-thunder-phase7-m1-capacity-leak.md
+
+## D-25..D-28 (2026-05-01): Phase 7 M2 — streaming wire-up across 3 protocols
+
+`<SIGNED-OFF>` New `model_gateway/src/sse/` module: 5 files (mod, extractor, openai_chat, anthropic, responses), 31 unit tests covering complete streams / partial chunks across event boundaries / cross-byte splits / strip-usage-chunk / no-usage fallback / cumulative output_tokens / cache_read_input_tokens.
+
+**D-25**: SSE extraction code lives in independent crate-level module `model_gateway/src/sse/`, not inline in `routers/http/router.rs`. Cleaner unit testing (no router fixture needed); future gRPC streaming can reuse.
+
+**D-26**: Streaming progress events use channel pattern (`StreamingProgressEvent` + `streaming_progress_sender`) mirroring P1 `usage_sender`. ThunderPolicy spawns `progress_consumer_task` that drains and updates `Program.total_tokens` (matches Python's `update_program_tokens_streaming`).
+
+**D-27**: SMG forces `stream_options.include_usage=true` on OpenAI Chat streaming requests (overrides any client setting), and strips the usage chunk from the response if the client didn't originally request it. Client-transparent rewrite. Two intentional divergences from Python's `setdefault` semantics.
+
+**D-28**: Anthropic incremental token tracking reads `output_tokens` cumulative from `message_delta` events (not Python's event-count heuristic, which is inaccurate for Anthropic where events are content blocks not tokens). Fixes a Python-side bug.
+
+**Wire-up**: `routers/http/router.rs::send_typed_request` accepts new `Option<ThunderStreamingCtx>` parameter. When present (Thunder + streaming), the spawn relay swaps to SSE-aware processing: feed → extract → conditionally strip → forward → emit progress + usage events. ProgramRequestGuard moves into the spawn closure so client disconnect triggers M1's Drop fallback.
+
+**Tests**: 31 SSE unit tests + 2 ThunderPolicy progress consumer unit tests. Total smg lib: 747 tests pass. Clippy strict clean.
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.2
+**Plan**: docs/superpowers/plans/2026-05-01-thunder-phase7-m2-streaming.md
