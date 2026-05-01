@@ -323,22 +323,56 @@ impl ThunderPolicy {
                     .program_id
                     .clone()
                     .unwrap_or_else(|| "default".to_string());
+
+                // Snapshot the per-program reservation BEFORE mutating state.
+                // TR sub-mode (P5+) reserves `estimated_reserved_tokens` on
+                // the chosen backend at admit time so concurrent arrivals
+                // see the load. On UsageEvent we un-reserve that estimate
+                // and add the actual usage instead — net delta on the
+                // backend = `total_tokens - reserved`.
+                //
+                // Default sub-mode never sets `estimated_reserved_tokens`,
+                // so this collapses to the old "+ total_tokens" path.
                 let mut guard = state_arc.write().await;
-                if let Some(p) = guard.programs.get_mut(&pid) {
-                    p.total_tokens = p.total_tokens.saturating_add(u64::from(event.total_tokens));
-                    if p.in_flight > 0 {
-                        p.in_flight -= 1;
-                    }
-                }
+                let reserved = guard
+                    .programs
+                    .get(&pid)
+                    .map(|p| p.estimated_reserved_tokens)
+                    .unwrap_or(0);
+
                 if let Some(b) = guard.backends.get_mut(&event.backend_url) {
+                    b.active_program_tokens = b.active_program_tokens.saturating_sub(reserved);
                     b.active_program_tokens = b
                         .active_program_tokens
                         .saturating_add(u64::from(event.total_tokens));
                 }
+                if let Some(p) = guard.programs.get_mut(&pid) {
+                    p.total_tokens = p.total_tokens.saturating_add(u64::from(event.total_tokens));
+                    p.estimated_reserved_tokens = 0;
+                    if p.in_flight > 0 {
+                        p.in_flight -= 1;
+                    }
+                }
+
+                // Broadcast wake — capacity may have freed for any
+                // currently-paused program. ★ Decision tag (autonomous):
+                // Broadcast (vs targeted-by-backend) is simpler. The
+                // re-evaluation under the lock filters out non-applicable
+                // wakes immediately. Backend count is bounded (≤ tens) so
+                // thundering herd is small. Optimization deferred to P9.
+                let waiting: Vec<Arc<Notify>> =
+                    guard.waiting_events.values().cloned().collect();
+                drop(guard);
+                for n in &waiting {
+                    n.notify_waiters();
+                }
+
                 trace!(
                     program_id = %pid,
                     backend = %event.backend_url,
                     total_tokens = event.total_tokens,
+                    reserved_unwound = reserved,
+                    waiters_woken = waiting.len(),
                     "usage applied"
                 );
             }
@@ -835,5 +869,264 @@ mod tests {
         let state = policy.snapshot_state().await;
         let prog = state.programs.get("default").expect("default program");
         assert_eq!(prog.total_tokens, 3);
+    }
+
+    // ---------- TR sub-mode tests (Phase 5+6) ----------
+
+    /// `has_capacity` returns true on unknown / not-yet-polled backends
+    /// (cold-start optimism) and applies `reserved_fraction` slack when
+    /// capacity is known.
+    #[tokio::test]
+    async fn has_capacity_optimistic_on_unknown_or_zero() {
+        let mut state = RouterState::default();
+        // Unknown backend → optimistic (true)
+        assert!(state.has_capacity("http://unknown:8000", 1_000, 0.10));
+        // Known but not-yet-polled (capacity_tokens = 0) → optimistic
+        state.refresh_backends(&["http://w0:8000".to_string()]);
+        assert!(state.has_capacity("http://w0:8000", 1_000, 0.10));
+        // Known + polled: 1000 capacity, 0.10 reserved → 900 usable
+        state
+            .backends
+            .get_mut("http://w0:8000")
+            .expect("seeded above")
+            .capacity_tokens = 1_000;
+        assert!(state.has_capacity("http://w0:8000", 800, 0.10));
+        assert!(!state.has_capacity("http://w0:8000", 901, 0.10));
+    }
+
+    /// TR-mode admit on a healthy backend reserves `estimated_reserved_tokens`
+    /// on both `Program` and `BackendState`.
+    #[tokio::test]
+    async fn tr_mode_admit_reserves_estimated_tokens() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig {
+                sub_mode: ThunderSubMode::Tr,
+                capacity_reserved_fraction: 0.0,
+                resume_timeout_secs: 5,
+                ..Default::default()
+            },
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        // Manually seed capacity (without waiting for the poll task).
+        {
+            let mut g = policy.state.write().await;
+            g.refresh_backends(&[workers[0].url().to_string()]);
+            g.backends
+                .get_mut(workers[0].url())
+                .expect("seeded above")
+                .capacity_tokens = 10_000;
+        }
+        let info = SelectWorkerInfo {
+            program_id: Some("tr-admit"),
+            request_text: Some(&"x".repeat(40)), // 40 chars / 4 = 10 prompt tokens
+            ..Default::default()
+        };
+        let idx = policy.select_worker_async(&workers, &info).await;
+        assert_eq!(idx, Some(0));
+
+        let snap = policy.snapshot_state().await;
+        let prog = snap.programs.get("tr-admit").expect("program created");
+        // 10 (prompt) + 256 (completion budget) = 266
+        assert_eq!(prog.estimated_reserved_tokens, 266);
+        let backend = snap.backends.get(workers[0].url()).expect("backend tracked");
+        assert_eq!(backend.active_program_tokens, 266);
+    }
+
+    /// usage_consumer must un-reserve `estimated_reserved_tokens` when the
+    /// matching `UsageEvent` arrives, replacing it with the actual usage.
+    #[tokio::test]
+    async fn tr_mode_usage_consumer_unreserves_then_applies_actual() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig {
+                sub_mode: ThunderSubMode::Tr,
+                capacity_reserved_fraction: 0.0,
+                resume_timeout_secs: 5,
+                ..Default::default()
+            },
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        {
+            let mut g = policy.state.write().await;
+            g.refresh_backends(&[workers[0].url().to_string()]);
+            g.backends
+                .get_mut(workers[0].url())
+                .expect("seeded")
+                .capacity_tokens = 10_000;
+        }
+        let info = SelectWorkerInfo {
+            program_id: Some("tr-unreserve"),
+            request_text: Some(&"y".repeat(40)),
+            ..Default::default()
+        };
+        let _ = policy.select_worker_async(&workers, &info).await;
+
+        // Snapshot before: reserved = 266
+        let pre = policy.snapshot_state().await;
+        assert_eq!(
+            pre.backends
+                .get(workers[0].url())
+                .expect("seeded")
+                .active_program_tokens,
+            266
+        );
+
+        // Send a UsageEvent reporting actual_total = 100 tokens
+        let tx = policy.usage_sender().expect("usage sender");
+        tx.send(UsageEvent {
+            program_id: Some("tr-unreserve".to_string()),
+            backend_url: workers[0].url().to_string(),
+            prompt_tokens: 60,
+            completion_tokens: 40,
+            total_tokens: 100,
+            request_text_chars: 40,
+        })
+        .expect("send");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let post = policy.snapshot_state().await;
+        let prog = post.programs.get("tr-unreserve").expect("program");
+        assert_eq!(
+            prog.estimated_reserved_tokens, 0,
+            "reservation must be cleared"
+        );
+        assert_eq!(prog.total_tokens, 100, "actual total must accumulate");
+        let backend = post.backends.get(workers[0].url()).expect("backend");
+        assert_eq!(
+            backend.active_program_tokens, 100,
+            "backend total = actual (266 reserved un-done, +100 actual)"
+        );
+    }
+
+    /// Pause-resume happy path: a TR request sees zero capacity, blocks on
+    /// Notify, then resumes when capacity is freed (via a synthetic
+    /// UsageEvent broadcast).
+    #[tokio::test]
+    async fn tr_mode_pauses_then_resumes_on_capacity_free() {
+        let policy = Arc::new(ThunderPolicy::with_metrics_client(
+            ThunderConfig {
+                sub_mode: ThunderSubMode::Tr,
+                capacity_reserved_fraction: 0.0,
+                resume_timeout_secs: 30, // long enough; the resume path fires first
+                ..Default::default()
+            },
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        ));
+        let workers = mock_workers(1);
+        // Seed capacity = 100 and pre-fill 100 used → no headroom.
+        {
+            let mut g = policy.state.write().await;
+            g.refresh_backends(&[workers[0].url().to_string()]);
+            let b = g
+                .backends
+                .get_mut(workers[0].url())
+                .expect("seeded above");
+            b.capacity_tokens = 100;
+            b.active_program_tokens = 100; // saturated
+            // Pre-create the program so usage_consumer's `programs.get_mut`
+            // path is exercised against an existing entry.
+            g.programs.insert(
+                "blocked-prog".to_string(),
+                Program::new("blocked-prog".to_string()),
+            );
+        }
+
+        // Spawn the TR select in a background task — it should pause.
+        let policy_for_task = policy.clone();
+        let workers_for_task = workers.clone();
+        let select_task = tokio::spawn(async move {
+            let info = SelectWorkerInfo {
+                program_id: Some("blocked-prog"),
+                request_text: Some("x"), // 1 char → 0 prompt + 256 = 256 estimated
+                ..Default::default()
+            };
+            policy_for_task
+                .select_worker_async(&workers_for_task, &info)
+                .await
+        });
+
+        // Give the task time to register the Notify and pause.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !select_task.is_finished(),
+            "TR select must be paused on saturated backend"
+        );
+        let snap = policy.snapshot_state().await;
+        assert!(
+            snap.waiting_events.contains_key("blocked-prog"),
+            "Notify must be registered for paused program"
+        );
+
+        // Free capacity directly + send UsageEvent to broadcast the wake.
+        // (In production, capacity-free comes from real backend usage; here
+        // we synthesize.)
+        {
+            let mut g = policy.state.write().await;
+            let b = g
+                .backends
+                .get_mut(workers[0].url())
+                .expect("seeded");
+            b.active_program_tokens = 0; // freed
+        }
+        // Send a no-op-ish UsageEvent to trigger the broadcast.
+        let tx = policy.usage_sender().expect("usage sender");
+        tx.send(UsageEvent {
+            program_id: Some("freer".to_string()), // distinct pid; doesn't matter
+            backend_url: workers[0].url().to_string(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            request_text_chars: 0,
+        })
+        .expect("send");
+
+        // The blocked task should now resume + admit.
+        let result = tokio::time::timeout(Duration::from_secs(5), select_task)
+            .await
+            .expect("must resume within 5s")
+            .expect("task must not panic");
+        assert_eq!(result, Some(0), "blocked program must admit on resume");
+    }
+
+    /// Force-admit-after-timeout fires when the deadline passes without
+    /// any capacity-free signal.
+    #[tokio::test]
+    async fn tr_mode_force_admits_after_timeout() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig {
+                sub_mode: ThunderSubMode::Tr,
+                capacity_reserved_fraction: 0.0,
+                resume_timeout_secs: 1, // 1s timeout → fires fast
+                ..Default::default()
+            },
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        // Saturate the backend permanently.
+        {
+            let mut g = policy.state.write().await;
+            g.refresh_backends(&[workers[0].url().to_string()]);
+            let b = g.backends.get_mut(workers[0].url()).expect("seeded");
+            b.capacity_tokens = 100;
+            b.active_program_tokens = 100;
+        }
+        let info = SelectWorkerInfo {
+            program_id: Some("force-prog"),
+            request_text: Some("x"),
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let result = policy.select_worker_async(&workers, &info).await;
+        let elapsed = start.elapsed();
+        assert_eq!(result, Some(0), "force-admit must return the only worker");
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "force-admit must wait ≥ ~1s timeout (took {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "force-admit should not wait significantly past timeout (took {elapsed:?})"
+        );
     }
 }
