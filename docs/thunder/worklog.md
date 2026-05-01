@@ -904,3 +904,16 @@ Closed plan: `docs/superpowers/plans/2026-05-01-thunder-p5p6-capacity-pause-resu
 
 (Pending Claude review + user sign-off.)
 
+
+## D-23 (2026-05-01): Phase 7 launched as full production scope (M1 Gap 5 capacity leak fix)
+
+`<SIGNED-OFF>` Phase 7 launched as full production scope (8 milestones M1-M8, no deferrals). M1 ships first as the production-blocker bug fix.
+
+**Decision**: `ProgramRequestGuard::Drop` cleanup task now mirrors `usage_consumer_task`'s un-reserve logic — saturating_sub of `estimated_reserved_tokens` from `backend.active_program_tokens`, plus zeroing `program.estimated_reserved_tokens` to prevent double-unreserve. Idempotency preserved via existing `completed: bool` flag.
+
+**Why now**: Without this fix, every client disconnect on a TR-mode admit (and after M2 lands, every streaming disconnect too) leaks reservation. Production uptime > a few hours saturates every backend's apparent capacity.
+
+**Tests**: 4 new unit tests in `policies::thunder::tests` cover happy-path Drop, complete() suppression, missing program defense, saturating_sub edge case. 18/18 thunder tests pass; clippy clean.
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.1
+**Plan**: docs/superpowers/plans/2026-05-01-thunder-phase7-m1-capacity-leak.md

@@ -484,18 +484,38 @@ impl Drop for ProgramRequestGuard {
         )]
         tokio::spawn(async move {
             let mut guard = state.write().await;
+
+            // Mirror usage_consumer_task's un-reserve pattern but skip the
+            // "+ actual_total_tokens" step since no UsageEvent arrived.
+            let (reserved, backend_url) = guard
+                .programs
+                .get(&pid)
+                .map(|p| (p.estimated_reserved_tokens, p.backend_url.clone()))
+                .unwrap_or((0, None));
+
+            if let Some(url) = backend_url {
+                if let Some(b) = guard.backends.get_mut(&url) {
+                    b.active_program_tokens = b.active_program_tokens.saturating_sub(reserved);
+                }
+            }
             if let Some(p) = guard.programs.get_mut(&pid) {
+                p.estimated_reserved_tokens = 0;
                 if p.in_flight > 0 {
                     p.in_flight -= 1;
                 }
             }
             // A slot may have freed — broadcast so paused programs re-check.
+            // (M6 will replace broadcast with a scheduler signal.)
             let waiting: Vec<Arc<Notify>> = guard.waiting_events.values().cloned().collect();
             drop(guard);
             for n in &waiting {
                 n.notify_waiters();
             }
-            trace!(program_id = %pid, "ProgramRequestGuard drop cleanup");
+            trace!(
+                program_id = %pid,
+                reserved_unwound = reserved,
+                "ProgramRequestGuard drop fallback (no usage)"
+            );
         });
     }
 }
@@ -1304,5 +1324,142 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "force-admit should not wait significantly past timeout (took {elapsed:?})"
         );
+    }
+
+    /// M1: Drop fallback must un-reserve estimated_reserved_tokens from
+    /// backend.active_program_tokens. Without this, every client disconnect
+    /// leaks reservation and TR mode eventually thinks all backends are full.
+    #[tokio::test]
+    async fn drop_unreserves_estimated_tokens() {
+        let policy = ThunderPolicy::with_defaults();
+        let backend_url = "http://b1:8000".to_string();
+
+        {
+            let mut state = policy.state.write().await;
+            state.backends.insert(backend_url.clone(), BackendState {
+                active_programs: ["pid-leak".to_string()].into_iter().collect(),
+                active_program_tokens: 500,
+                capacity_tokens: 1000,
+            });
+            state.programs.insert("pid-leak".to_string(), Program {
+                program_id: "pid-leak".to_string(),
+                backend_url: Some(backend_url.clone()),
+                in_flight: 1,
+                total_tokens: 0,
+                step_count: 1,
+                estimated_reserved_tokens: 500,
+            });
+        }
+
+        {
+            let _guard = policy.create_guard("pid-leak");
+        }
+
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let state = policy.state.read().await;
+            let b = state.backends.get(&backend_url).unwrap();
+            if b.active_program_tokens == 0 {
+                let p = state.programs.get("pid-leak").unwrap();
+                assert_eq!(p.estimated_reserved_tokens, 0, "reservation cleared");
+                assert_eq!(p.in_flight, 0, "in_flight decremented");
+                return;
+            }
+        }
+        panic!("Drop fallback never un-reserved tokens (capacity leak persists)");
+    }
+
+    /// M1: complete() must suppress Drop's un-reserve so usage_consumer's
+    /// cleanup is the sole authority on the happy path.
+    #[tokio::test]
+    async fn complete_suppresses_drop_unreserve() {
+        let policy = ThunderPolicy::with_defaults();
+        let backend_url = "http://b1:8000".to_string();
+        {
+            let mut state = policy.state.write().await;
+            state.backends.insert(backend_url.clone(), BackendState {
+                active_programs: ["pid-c".to_string()].into_iter().collect(),
+                active_program_tokens: 500,
+                capacity_tokens: 1000,
+            });
+            state.programs.insert("pid-c".to_string(), Program {
+                program_id: "pid-c".to_string(),
+                backend_url: Some(backend_url.clone()),
+                in_flight: 1,
+                total_tokens: 0,
+                step_count: 1,
+                estimated_reserved_tokens: 500,
+            });
+        }
+
+        {
+            let mut g = policy.create_guard("pid-c");
+            g.complete();
+        }
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let state = policy.state.read().await;
+        let b = state.backends.get(&backend_url).unwrap();
+        assert_eq!(
+            b.active_program_tokens, 500,
+            "complete() must suppress Drop's un-reserve"
+        );
+        let p = state.programs.get("pid-c").unwrap();
+        assert_eq!(p.estimated_reserved_tokens, 500, "reserved untouched");
+        assert_eq!(p.in_flight, 1, "in_flight untouched");
+    }
+
+    /// M1: Drop on a missing program must not panic (defensive).
+    #[tokio::test]
+    async fn drop_with_no_program_does_not_panic() {
+        let policy = ThunderPolicy::with_defaults();
+        {
+            let _g = policy.create_guard("pid-missing");
+        }
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// M1: saturating_sub clamps when reserved > backend's current balance
+    /// (defensive against any prior accounting drift).
+    #[tokio::test]
+    async fn drop_saturates_when_reserved_exceeds_backend_balance() {
+        let policy = ThunderPolicy::with_defaults();
+        let backend_url = "http://b1:8000".to_string();
+        {
+            let mut state = policy.state.write().await;
+            state.backends.insert(backend_url.clone(), BackendState {
+                active_programs: ["pid-sat".to_string()].into_iter().collect(),
+                active_program_tokens: 100,
+                capacity_tokens: 1000,
+            });
+            state.programs.insert("pid-sat".to_string(), Program {
+                program_id: "pid-sat".to_string(),
+                backend_url: Some(backend_url.clone()),
+                in_flight: 1,
+                total_tokens: 0,
+                step_count: 1,
+                estimated_reserved_tokens: 500,
+            });
+        }
+        {
+            let _g = policy.create_guard("pid-sat");
+        }
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let state = policy.state.read().await;
+            let b = state.backends.get(&backend_url).unwrap();
+            if b.active_program_tokens == 0 {
+                return;
+            }
+        }
+        panic!("active_program_tokens did not saturate to 0");
     }
 }
