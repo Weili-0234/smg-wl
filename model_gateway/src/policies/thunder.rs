@@ -671,9 +671,7 @@ impl ThunderPolicy {
                     estimated_tokens,
                     self.config.capacity_reserved_fraction,
                 ) {
-                    let Some(idx) = workers.iter().position(|w| w.url() == chosen_url) else {
-                        return None;
-                    };
+                    let idx = workers.iter().position(|w| w.url() == chosen_url)?;
                     state.assign(&program_id, &chosen_url);
                     // Reserve the estimate so concurrent arrivals to the
                     // same backend see the load and pause.
@@ -746,6 +744,15 @@ impl ThunderPolicy {
     /// Conservative token-cost estimate for a request: 4 chars / token for
     /// the prompt + 256 token completion budget (D-22 simplification — full
     /// `char_to_token_ratio` calibration deferred to P9).
+    ///
+    /// `&self` is currently unused — kept as a method (rather than an
+    /// associated function) so P9's per-program `char_to_token_ratio`
+    /// momentum (Q5.5) can be wired in by reaching `self.state` without
+    /// touching call sites.
+    #[expect(
+        clippy::unused_self,
+        reason = "method signature stable for P9 char_to_token_ratio calibration"
+    )]
     fn estimate_request_tokens(&self, info: &SelectWorkerInfo<'_>) -> u64 {
         let request_chars = info.request_text.map(str::len).unwrap_or(0);
         let prompt_estimate = (request_chars / 4) as u64;
@@ -1129,6 +1136,10 @@ mod tests {
         // Spawn the TR select in a background task — it should pause.
         let policy_for_task = policy.clone();
         let workers_for_task = workers.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only fire-and-forget; awaited via JoinHandle below"
+        )]
         let select_task = tokio::spawn(async move {
             let info = SelectWorkerInfo {
                 program_id: Some("blocked-prog"),
