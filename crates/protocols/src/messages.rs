@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use validator::Validate;
 
-use crate::{skills::MessagesSkillRef, validated::Normalizable};
+use crate::{common::GenerationRequest, skills::MessagesSkillRef, validated::Normalizable};
 
 // ============================================================================
 // Request Types
@@ -102,6 +102,76 @@ impl CreateMessageRequest {
         self.mcp_servers
             .as_deref()
             .filter(|servers| !servers.is_empty())
+    }
+}
+
+impl GenerationRequest for CreateMessageRequest {
+    fn is_stream(&self) -> bool {
+        self.stream.unwrap_or(false)
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        let mut buffer = String::new();
+        let mut has_content = false;
+
+        if let Some(system) = &self.system {
+            match system {
+                SystemContent::String(s) => {
+                    if !s.is_empty() {
+                        buffer.push_str(s);
+                        has_content = true;
+                    }
+                }
+                SystemContent::Blocks(blocks) => {
+                    for block in blocks {
+                        if !block.text.is_empty() {
+                            if has_content {
+                                buffer.push(' ');
+                            }
+                            buffer.push_str(&block.text);
+                            has_content = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        for msg in &self.messages {
+            match &msg.content {
+                InputContent::String(s) => {
+                    if !s.is_empty() {
+                        if has_content {
+                            buffer.push(' ');
+                        }
+                        buffer.push_str(s);
+                        has_content = true;
+                    }
+                }
+                InputContent::Blocks(blocks) => {
+                    for block in blocks {
+                        if let InputContentBlock::Text(text_block) = block {
+                            if !text_block.text.is_empty() {
+                                if has_content {
+                                    buffer.push(' ');
+                                }
+                                buffer.push_str(&text_block.text);
+                                has_content = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        buffer
+    }
+
+    fn program_id_hint(&self) -> Option<&str> {
+        self.metadata.as_ref()?.program_id.as_deref()
     }
 }
 
@@ -2204,5 +2274,143 @@ mod tests {
             ContentBlock::ToolSearchToolResult { .. }
         ));
         assert!(matches!(msg.content[2], ContentBlock::ToolUse { .. }));
+    }
+
+    #[test]
+    fn generation_request_is_stream_default_false() {
+        let req = CreateMessageRequest {
+            model: "test-model".into(),
+            messages: vec![],
+            max_tokens: 100,
+            metadata: None,
+            service_tier: None,
+            stop_sequences: None,
+            stream: None,
+            system: None,
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            container: None,
+            mcp_servers: None,
+        };
+        assert!(!<CreateMessageRequest as GenerationRequest>::is_stream(
+            &req
+        ));
+        assert_eq!(
+            <CreateMessageRequest as GenerationRequest>::get_model(&req),
+            Some("test-model")
+        );
+    }
+
+    #[test]
+    fn generation_request_program_id_hint_reads_metadata() {
+        let with_id = CreateMessageRequest {
+            model: "m".into(),
+            messages: vec![],
+            max_tokens: 1,
+            metadata: Some(Metadata {
+                user_id: None,
+                program_id: Some("p1".into()),
+            }),
+            service_tier: None,
+            stop_sequences: None,
+            stream: None,
+            system: None,
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            container: None,
+            mcp_servers: None,
+        };
+        assert_eq!(with_id.program_id_hint(), Some("p1"));
+
+        let without = CreateMessageRequest {
+            metadata: None,
+            ..with_id.clone()
+        };
+        assert_eq!(without.program_id_hint(), None);
+
+        let no_pid = CreateMessageRequest {
+            metadata: Some(Metadata {
+                user_id: Some("u".into()),
+                program_id: None,
+            }),
+            ..with_id
+        };
+        assert_eq!(no_pid.program_id_hint(), None);
+    }
+
+    #[test]
+    fn extract_text_for_routing_string_content() {
+        let req = CreateMessageRequest {
+            model: "m".into(),
+            messages: vec![InputMessage {
+                role: Role::User,
+                content: InputContent::String("hello world".into()),
+            }],
+            max_tokens: 1,
+            metadata: None,
+            service_tier: None,
+            stop_sequences: None,
+            stream: None,
+            system: Some(SystemContent::String("you are helpful".into())),
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            container: None,
+            mcp_servers: None,
+        };
+        assert_eq!(
+            req.extract_text_for_routing(),
+            "you are helpful hello world"
+        );
+    }
+
+    #[test]
+    fn extract_text_for_routing_blocks_skip_non_text() {
+        let req = CreateMessageRequest {
+            model: "m".into(),
+            messages: vec![InputMessage {
+                role: Role::User,
+                content: InputContent::Blocks(vec![
+                    InputContentBlock::Text(TextBlock {
+                        text: "what is in this image?".into(),
+                        cache_control: None,
+                        citations: None,
+                    }),
+                    InputContentBlock::Image(ImageBlock {
+                        source: ImageSource::Url {
+                            url: "https://x/y.png".into(),
+                        },
+                        cache_control: None,
+                    }),
+                ]),
+            }],
+            max_tokens: 1,
+            metadata: None,
+            service_tier: None,
+            stop_sequences: None,
+            stream: None,
+            system: None,
+            temperature: None,
+            thinking: None,
+            tool_choice: None,
+            tools: None,
+            top_k: None,
+            top_p: None,
+            container: None,
+            mcp_servers: None,
+        };
+        // Image block is skipped; only the Text block contributes.
+        assert_eq!(req.extract_text_for_routing(), "what is in this image?");
     }
 }
