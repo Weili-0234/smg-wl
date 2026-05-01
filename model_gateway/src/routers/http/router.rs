@@ -293,12 +293,19 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
+        // Captured here so we can hand it to ThunderPolicy's usage_consumer
+        // after a successful non-streaming response. `extract` returns
+        // `Option<&str>` borrowed from `typed_req`, so we must materialize
+        // a String before crossing the await boundary.
+        let program_id_owned: Option<String> =
+            common_program_id::extract(typed_req).map(|s| s.to_string());
+
         let worker = match self
             .select_worker_for_model(
                 model_id,
                 Some(text),
                 headers,
-                common_program_id::extract(typed_req),
+                program_id_owned.as_deref(),
             )
             .await
         {
@@ -363,6 +370,67 @@ impl Router {
                 metrics_labels::CONNECTION_HTTP,
                 error_type_from_status(status),
             );
+        }
+
+        // -------- Phase 4: non-streaming usage emission --------
+        //
+        // For policies that implement `usage_sender()` (today: ThunderPolicy),
+        // parse `usage` out of the JSON response body and fire-and-forget a
+        // `UsageEvent`. Streaming requests skip this — SSE tail extraction
+        // is deferred per <CLAUDE-AUTONOMOUS-DECISION> D-20.
+        //
+        // We deconstruct the response and rebuild it with the same bytes so
+        // callers see exactly the original payload. `to_bytes` consumes the
+        // body, but the non-streaming branch in `send_typed_request` already
+        // buffered the full body into `Body::from(bytes)` so this is just a
+        // refcount move on the underlying `bytes::Bytes`, not a re-copy.
+        if !is_stream && status.is_success() {
+            if let Some(tx) = policy.usage_sender() {
+                let (parts, body) = response.into_parts();
+                match to_bytes(body, usize::MAX).await {
+                    Ok(buf) => {
+                        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&buf) {
+                            if let Some(usage) = parsed.get("usage") {
+                                let prompt_tokens = usage
+                                    .get("prompt_tokens")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    as u32;
+                                let completion_tokens = usage
+                                    .get("completion_tokens")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .unwrap_or(0)
+                                    as u32;
+                                let total_tokens = prompt_tokens.saturating_add(completion_tokens);
+                                // Fire-and-forget. send() only fails if the
+                                // receiver was dropped (= policy dropped =
+                                // process shutdown), in which case we have no
+                                // useful action.
+                                let _ = tx.send(crate::policies::UsageEvent {
+                                    program_id: program_id_owned,
+                                    backend_url: worker.url().to_string(),
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                    request_text_chars: text.len(),
+                                });
+                            }
+                        }
+                        return Response::from_parts(parts, Body::from(buf));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to buffer non-stream response body for usage emission: {e}"
+                        );
+                        // We've already consumed the body — return an error
+                        // rather than a half-empty response.
+                        return error::internal_error(
+                            "read_response_body_failed",
+                            format!("Failed to read response body: {e}"),
+                        );
+                    }
+                }
+            }
         }
 
         response
