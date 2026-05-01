@@ -15,6 +15,7 @@ use openai_protocol::{
     completion::CompletionRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
+    messages::CreateMessageRequest,
     rerank::{RerankRequest, RerankResponse, RerankResult},
     responses::ResponsesRequest,
     transcription::TranscriptionRequest,
@@ -1147,6 +1148,17 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_messages(
+        &self,
+        headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: &CreateMessageRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/messages", model_id)
+            .await
+    }
+
     async fn cancel_response(&self, headers: Option<&HeaderMap>, response_id: &str) -> Response {
         let endpoint = format!("v1/responses/{response_id}/cancel");
         self.route_post_empty_request(headers, &endpoint).await
@@ -1301,5 +1313,13 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[test]
+    fn route_messages_compiles_with_create_message_request() {
+        // Compile-time assertion: route_typed_request accepts CreateMessageRequest.
+        // (Real e2e covered by e2e_test/thunder/test_phase0_messages_passthrough.py.)
+        fn _assert_bounds<T: GenerationRequest + serde::Serialize + Clone + Send + Sync>() {}
+        _assert_bounds::<CreateMessageRequest>();
     }
 }
