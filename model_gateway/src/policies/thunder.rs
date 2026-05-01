@@ -1002,7 +1002,11 @@ impl ThunderPolicy {
         }
 
         // Refresh backend index from current worker set
-        let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+        let urls: Vec<String> = workers
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .filter(|u| info.avoid_backend != Some(u.as_str()))
+                    .collect();
         state.refresh_backends(&urls);
 
         // Q5.2 fallback: missing program_id resolves to a "default" pseudo-program
@@ -1090,7 +1094,11 @@ impl ThunderPolicy {
             let estimated_tokens: u64;
             let notify = {
                 let mut state = self.state.write().await;
-                let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
+                let urls: Vec<String> = workers
+                    .iter()
+                    .map(|w| w.url().to_string())
+                    .filter(|u| info.avoid_backend != Some(u.as_str()))
+                    .collect();
                 state.refresh_backends(&urls);
                 estimated_tokens = self.estimate_request_tokens(info, &state);
 
@@ -1246,6 +1254,8 @@ impl ThunderPolicy {
         estimated_tokens: u64,
     ) -> Option<usize> {
         let mut state = self.state.write().await;
+        // Force-admit is last resort — ignore avoid_backend filter (we'd rather
+        // hit a previously-failed backend than time out the request entirely).
         let urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
         state.refresh_backends(&urls);
         let chosen_url = state.select_least_active(&urls)?;

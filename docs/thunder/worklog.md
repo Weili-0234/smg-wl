@@ -975,3 +975,13 @@ Program lifecycle state machine added: `ProgramStatus { Idle, Reasoning, Acting,
 **pick_tr** detects BFD-pre-reserved programs (estimated_reserved_tokens > 0 AND backend_url matches chosen) and skips re-reservation — prevents double-booking of capacity when scheduler woke the program before pick_tr re-acquires lock.
 
 **Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.5, §3.6
+
+## D-35 (2026-05-01): Phase 7 M7 — streaming retry × idempotency
+
+`<SIGNED-OFF>` `SelectWorkerInfo` extended with `avoid_backend: Option<&'a str>`. Thunder's `pick_default_inner` and `pick_tr` honor it by filtering candidate workers; `force_admit_after_timeout` exempted (last-resort path needs all backends).
+
+**Boundary semantics**: SMG's existing `RetryExecutor::execute_response_with_retry` + `is_retryable_status` already implements the 200-OK boundary correctly: only 5xx responses are retryable; once upstream returns 2xx the `Response` object is taken as final. For streaming, the `bytes_stream()` only starts if status is 2xx (in the streaming branch); for 5xx the non-stream branch reads the error body. So the implicit boundary is already enforced.
+
+**Cross-retry guard idempotency**: `ProgramRequestGuard` is created per-call to `route_typed_request_once`, but `route_typed_request_once` is the operation closure inside `RetryExecutor`. Each retry creates a new guard. This means in_flight could over-count across retries. Acceptable for first-pass since retries are rare and saturating_sub protects the floor; clean fix (one guard per retry-cycle) deferred to follow-up.
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.7

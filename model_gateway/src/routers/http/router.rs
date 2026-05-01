@@ -204,6 +204,7 @@ impl Router {
                     hash_ring,
                     program_id,
                     declared_max_tokens: None,
+                    avoid_backend: None,
                 },
             )
             .await?;
@@ -476,7 +477,7 @@ impl Router {
                                     total_tokens,
                                     request_text_chars: text.len(),
                                     cache_read_input_tokens: None,
-            declared_max_tokens: None,
+                                        declared_max_tokens: None,
                                 });
                                 // Happy path: usage_consumer will handle
                                 // in_flight decrement. Suppress the guard's
@@ -726,6 +727,7 @@ impl Router {
                 hash_ring,
                 program_id: None,
                 declared_max_tokens: None,
+                avoid_backend: None,
             },
         ) {
             Some(i) => i,
@@ -1169,7 +1171,7 @@ impl Router {
                                         total_tokens,
                                         request_text_chars,
                                         cache_read_input_tokens: cache_read,
-            declared_max_tokens: None,
+                                        declared_max_tokens: None,
                                     });
                                     guard.complete();
                                     if tokens_since_last_progress > 0 {
@@ -1204,7 +1206,7 @@ impl Router {
                             total_tokens,
                             request_text_chars,
                             cache_read_input_tokens: cache_read,
-            declared_max_tokens: None,
+                                        declared_max_tokens: None,
                         });
                         guard.complete();
                     }

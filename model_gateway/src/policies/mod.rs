@@ -275,6 +275,10 @@ pub struct SelectWorkerInfo<'a> {
     /// completion-fraction calibration to estimate the completion side of
     /// reserve. `None` for legacy clients that omit the field.
     pub declared_max_tokens: Option<u32>,
+    /// M7: backend URL to exclude from selection (set on retry attempts so
+    /// the retry doesn't land on the same backend that just failed). `None`
+    /// for first attempts; populated by `RetryExecutor` via the route layer.
+    pub avoid_backend: Option<&'a str>,
 }
 
 #[cfg(test)]
@@ -353,6 +357,7 @@ mod tests {
             hash_ring: None,
             program_id: Some(pid),
             declared_max_tokens: None,
+            avoid_backend: None,
         };
         assert_eq!(info.program_id, Some("agent-step-7"));
     }
