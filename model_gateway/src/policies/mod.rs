@@ -23,6 +23,7 @@ mod prefix_hash;
 mod random;
 mod registry;
 mod round_robin;
+mod thunder;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
@@ -38,6 +39,7 @@ pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
+pub use thunder::ThunderPolicy;
 
 /// Per-request usage event emitted by routers after the upstream stream completes.
 ///
