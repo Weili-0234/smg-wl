@@ -383,3 +383,41 @@ A bash sanity script `scripts/check_thunder_xref.sh` checks: (a) markdown links 
 ### Approved by
 
 Weili Xu, 2026-04-30 session ("好，就用 Option α").
+
+---
+
+## D-16: P0 implementation completed — /v1/messages pass-through landed
+
+**Date**: 2026-04-30
+**Spec ref**: `docs/thunder/10-phases.md` P0 row, `docs/thunder/04-smg-integration.md` §5.5b/c/d/e
+
+### What landed
+
+- `GenerationRequest::program_id_hint` (default-None) on the trait at `crates/protocols/src/common.rs:40`
+- `Metadata.program_id: Option<String>` at `crates/protocols/src/messages.rs:178`
+- `impl GenerationRequest for CreateMessageRequest` (4 methods, ~55 LOC) at `crates/protocols/src/messages.rs`
+- `"/v1/messages" => ENDPOINT_MESSAGES` arm at `model_gateway/src/routers/grpc/utils/metrics.rs:8`
+- `Router::route_messages` pass-through at `model_gateway/src/routers/http/router.rs`
+- e2e: `e2e_test/thunder/{__init__.py,conftest.py,mock_vllm.py,test_phase0_messages_passthrough.py}` — 3 tests pass
+- Mock backend exposes `/v1/models` + `/version` per Task 7's discovery-fix commit `063ccb64` — required because SMG's `workflow/steps/local/{detect_backend,discover_metadata}.rs` probes these to classify and learn the served model id
+
+### What did NOT change
+
+- No policy code touched (thunder.rs doesn't exist yet)
+- No CLI changes (`--policy thunder` still rejected at clap parse)
+- No anthropic router changes (3rd-party path out of scope)
+- No PD changes
+- No gRPC changes (gRPC validation in P7)
+
+### Footgun (production note)
+
+**Production note**: any sidecar fronting an internal backend (litellm-proxy, custom proxies, etc.) must also expose `/v1/models` and `/version`, otherwise SMG worker registration fails with 404 model_not_found. litellm-proxy already does this; custom sidecars need to be checked.
+
+### Revisit conditions
+
+1. If P3 reveals that `extract_text_for_routing` for CreateMessageRequest needs to include ToolResultBlock content (e.g. for cache-aware routing of tool-heavy programs), expand the impl — this is non-breaking.
+2. If litellm-proxy is later observed to pass through `metadata.program_id` (current spec §10.5 footgun says it strips), revisit whether the gateway should forward `program_id` as well so backends can use it for KV-cache stickiness hints.
+
+### Approved by
+
+(Pending P0 implementation commit + user review.)
