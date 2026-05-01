@@ -160,3 +160,8 @@ clients/java/target/
 clients/java/build.sbt
 clients/java/gradle.properties
 openapitools.json
+
+# Codex CLI / IDE extension artifacts (codex exec session state, app-server markers)
+.codex
+.codex/
+.codex_session/
