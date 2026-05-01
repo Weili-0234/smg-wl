@@ -555,3 +555,176 @@ Weili Xu, 2026-04-30 session ("好，就用 Option α").
 ### Approved by
 
 (Pending Claude review + user sign-off.)
+
+---
+
+## D-20: P4 implementation completed — capacity polling + non-streaming usage emission
+
+**Date**: 2026-05-01
+**Spec ref**: `docs/superpowers/plans/2026-05-01-thunder-p4-metrics-and-usage.md`, `docs/thunder/04-smg-integration.md` §5.6-5.7
+**Approval mode**: <CLAUDE-AUTONOMOUS-DECISION> — Opus subagent executed under Claude review; user sign-off pending.
+
+### What landed
+
+- New `model_gateway/src/policies/thunder_metrics.rs` (~190 LOC w/ tests):
+  `MetricsClient` async trait, `HttpMetricsClient` impl polling
+  `/get_server_info`, `BackendCapacity` snapshot type, 4 unit tests on URL
+  normalization + JSON parse fallbacks.
+- `ThunderPolicy::new` (production constructor) and new
+  `ThunderPolicy::with_metrics_client` (test/injection constructor) spawn
+  **two** tokio tasks:
+  - `capacity_poll_task` — every `capacity_poll_interval_secs` (default 5),
+    fetches each known backend's capacity and updates
+    `BackendState.capacity_tokens`.
+  - `usage_consumer_task` — drains `mpsc::UnboundedReceiver<UsageEvent>`,
+    bumps `Program.total_tokens` (saturating) + decrements `in_flight` +
+    accumulates `BackendState.active_program_tokens`.
+  Both tasks hold `Weak<RwLock<RouterState>>` for clean drop semantics.
+- `ThunderPolicy::usage_sender()` overrides the trait default to return
+  `Some(&self.usage_tx)`.
+- `ThunderConfig.capacity_poll_interval_secs` (u64, default 5) wired
+  through `PolicyConfig::Thunder`, `validate_policy`, `PolicyFactory`,
+  and `--thunder-capacity-poll-interval-secs` CLI flag.
+- `routers/http/router.rs::route_typed_request_once` post-non-stream
+  branch: re-buffer body via `to_bytes`, parse `usage` from JSON, fire
+  `UsageEvent` through `policy.usage_sender()`, reconstruct response.
+  Skips entirely when `is_stream` or `policy.usage_sender()` is `None`.
+- 2 new unit tests in `policies::thunder` (synthetic `UsageEvent` end-to-end
+  through a stub `MetricsClient`); 4 new tests in `policies::thunder_metrics`.
+
+**Result**: 117 lib tests in `policies` pass; 708 total `smg` lib tests
+pass; clippy `--all-targets --all-features -- -D warnings` clean across
+the workspace; 10/10 thunder e2e tests pass (P0 + P2 + P3 regression).
+4 commits on `thunder-policy-p4`: 0d7aa9fc, b7383263, dd3e57ae, bb69ca04.
+
+### What did NOT change (deferred per autonomous trim)
+
+- **Streaming SSE usage tail extractor** — bytes_stream branches in
+  `routers/http/router.rs:712,923` left untouched.
+- **`stream_options.include_usage = true` injection** on outbound
+  streaming requests.
+- gRPC `KvEventMonitor`-driven capacity → P7.
+- TR sub-mode admission gate using new `BackendState.capacity_tokens` → P5.
+- Pause/resume + BFD scheduler tick → P6.
+- `ProgramRequestGuard` RAII for in_flight cleanup on early returns → P6.
+- Anthropic / OpenAI / Gemini routers: unchanged (out of scope).
+
+### Autonomous decisions made (require user review)
+
+1. **P4 scope reduced (per the plan's <CLAUDE-AUTONOMOUS-DECISION> D-20 directive)** —
+   ship "capacity polling + non-streaming usage emission" only. Streaming
+   usage tail extraction is deferred to a possible P4.5 or P9 polish pass.
+   Rationale: SSE parsing for the Anthropic, OpenAI Chat, and OpenAI
+   Responses tail formats has different shapes per protocol and adds risk
+   under time pressure; non-streaming alone gives ThunderPolicy the
+   `total_tokens` signal it needs to start exercising the algorithm.
+   Streaming requests still flow pass-through (no Thunder state update),
+   matching P0 baseline behavior. ★
+
+2. **Local `GetServerInfoResponse` parse type instead of extending the
+   shared `discover_metadata::ServerInfo`.** The existing `ServerInfo` is
+   the flat sglang shape used by `flat_labels` for backend metadata
+   discovery — it has `model_path`, `tp_size`, `version`, etc. but **no**
+   `cache_config` nested object and no `total_kv_cache_tokens`. Extending
+   it would ripple through the metadata-discovery codepath that populates
+   worker labels for the registry. Defining a tiny private parse type
+   inside `thunder_metrics.rs` keeps the blast radius zero. The mock
+   vLLM (`e2e_test/thunder/mock_vllm.py`) returns exactly the shape we
+   parse; real vLLM versions vary on whether `total_kv_cache_tokens` is
+   present, so we prefer it when there and fall back to
+   `block_size * num_gpu_blocks` otherwise. ★
+
+3. **`Weak<RwLock<RouterState>>` cycle-break for tokio tasks.** The
+   capacity poll and usage consumer tasks need `'static` ownership but
+   must not keep the policy alive after drop. Holding `Weak` and calling
+   `upgrade()` on each loop iteration lets the task exit cleanly when the
+   policy is dropped (process shutdown or test teardown). Alternatives
+   considered: (a) `Arc<RouterState>` with explicit shutdown channel —
+   more code, same outcome; (b) abort handles stored on the policy —
+   needs a Drop impl, awkward when the policy is held inside an
+   `Arc<dyn LoadBalancingPolicy>`. ★
+
+4. **Fire-and-forget `let _ = tx.send(...)` for `UsageEvent`.**
+   `mpsc::UnboundedSender::send` only fails when the receiver is dropped,
+   which only happens when the policy is dropped (process shutdown).
+   Logging or returning the error in that path adds noise without
+   actionable value. Same pattern is used by other "drop on shutdown"
+   paths in the codebase (e.g. the streaming forward channel in
+   `send_typed_request`). ★
+
+5. **Unbounded `mpsc` for usage events** (matches D-2). Routers must not
+   block the response path. Each event is ~64B; the consumer is a tight
+   async loop that drains as fast as the lock allows. Bounded + try_send
+   considered for P9 if benchmarks show pathological backlog under
+   high-QPS production traffic. Revisit if memory growth observed.
+
+6. **Default `capacity_poll_interval_secs = 5`.** Matches typical
+   load-balancer health-check cadence; KV-cache size doesn't change
+   intra-request, so longer is fine. Exposed as a CLI flag for
+   experimentation. The poll task uses
+   `tokio::time::interval(Duration::from_secs(secs))`, which catches up
+   missed ticks — acceptable here since fetch_capacity is idempotent. ★
+
+7. **Body re-buffering on non-streaming success.** To extract usage from
+   the response JSON we deconstruct the `Response` via `.into_parts()`,
+   `to_bytes(body, usize::MAX)`, parse, then rebuild with
+   `Response::from_parts(parts, Body::from(buf))`. This is a refcount
+   move on the underlying `bytes::Bytes` (no copy) because the
+   non-streaming branch in `send_typed_request` already buffered the body
+   into `Body::from(bytes)`. Stateless policies (random, round_robin,
+   etc.) return `None` from `usage_sender()` and skip the entire block —
+   zero overhead for non-Thunder routes. ★
+
+8. **`#[expect(dead_code)]` on `metrics_client` field** — the field is
+   captured into the spawned poll task via clone, so the struct field
+   itself is never read. Kept for `Debug` derivation and so P5+ TR-mode
+   admission gate can call `self.metrics_client.fetch_capacity` directly
+   without a re-fetch. The clippy `allow_attributes` lint rejects bare
+   `#[allow(...)]` and requires `#[expect(... reason = ...)]`.
+
+9. **Ownership of `program_id` in `route_typed_request_once`.**
+   `common_program_id::extract(typed_req)` returns `Option<&str>` borrowed
+   from `typed_req`. Stashing it for use after the await on
+   `send_typed_request` requires a `String` clone. The cost is one
+   short-string allocation per request — negligible compared to the
+   network round-trip and JSON parse. Alternative: pass `typed_req` deeper
+   so `extract` runs after the await — would force generic propagation
+   into more layers; not worth it.
+
+### Footguns surfaced
+
+1. **Body re-buffering doubles memory transiently** for the brief window
+   between `to_bytes` and `Body::from(buf)`. Typical chat responses are
+   < 100KB so this is negligible; if Thunder is ever applied to large
+   non-streaming responses (e.g. embeddings batches), revisit.
+2. **`usage_consumer_task` is unbounded.** A pathologically slow lock
+   contender on `RouterState` could let the channel grow. D-3 already
+   notes this; D-20 keeps the same posture (single RwLock, revisit P9).
+3. **Streaming requests do not yet update Thunder state.** This means
+   `Program.total_tokens` underreports if streaming is the dominant
+   path. P5 admission/pause logic must account for this until the
+   streaming tail extractor lands.
+4. **Capacity-poll task only refreshes backends already in
+   `RouterState.backends`.** A backend that has never received a
+   `select_worker` call won't appear there, so its capacity stays unknown
+   until first traffic. This matches the lazy-init pattern in
+   `RouterState::refresh_backends` but means TR-mode (P5+) must seed the
+   map proactively or accept "0 capacity → reject" on cold start.
+
+### Revisit conditions
+
+1. If streaming path becomes dominant in production → land the SSE tail
+   extractor (P4.5) before depending on `total_tokens` for admission
+   decisions in P5+.
+2. If real vLLM versions return `cache_config` under a different shape
+   (e.g. only `block_size`/`num_gpu_blocks` with no `total_kv_cache_tokens`)
+   → already handled by the fallback derivation; verify on first real
+   backend.
+3. If response body buffering shows up in profiles for high-QPS
+   non-streaming traffic → consider keeping the parse strictly on the
+   `usage` substring rather than full-document `serde_json::from_slice`.
+
+### Approved by
+
+(Pending Claude review + user sign-off.)
+
