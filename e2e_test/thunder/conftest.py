@@ -102,3 +102,44 @@ def smg_router(mock_backend):
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+@pytest.fixture(scope="session")
+def smg_thunder_router(mock_backend):
+    """SMG with --policy thunder, pointing at the same mock_backend.
+
+    Used by Phase 3+ tests; coexists with smg_router (cache_aware) so
+    Phase 0-2 tests keep passing under cache_aware.
+    """
+    port = _free_port()
+    binary = os.path.join(REPO_ROOT, "target", "debug", "smg")
+    if not os.path.exists(binary):
+        binary = os.path.join(REPO_ROOT, "target", "release", "smg")
+    if not os.path.exists(binary):
+        pytest.skip(
+            f"smg binary not found at target/{{debug,release}}/smg; "
+            f"run `cargo build -p smg` from {REPO_ROOT} first"
+        )
+    metrics_port = _free_port()
+    cmd = [
+        binary, "start",
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--worker-urls", mock_backend,
+        "--policy", "thunder",
+        "--thunder-sub-mode", "default",
+        # Metrics server defaults to :29000; use a free port so we don't
+        # collide with the other SMG fixture (smg_router) running in the
+        # same pytest session.
+        "--prometheus-port", str(metrics_port),
+    ]
+    proc = subprocess.Popen(cmd, cwd=REPO_ROOT)
+    try:
+        _wait_http(f"http://127.0.0.1:{port}/health", timeout=20)
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
