@@ -433,6 +433,9 @@ pub enum PolicyConfig {
         /// Scheduler tick interval in milliseconds (default 100).
         #[serde(default = "default_thunder_scheduler_tick_ms")]
         scheduler_tick_ms: u64,
+        /// Period between backend capacity-refresh polls in seconds (default 5).
+        #[serde(default = "default_thunder_capacity_poll_interval_secs")]
+        capacity_poll_interval_secs: u64,
     },
 }
 
@@ -470,6 +473,10 @@ fn default_thunder_resume_timeout_secs() -> u64 {
 
 fn default_thunder_scheduler_tick_ms() -> u64 {
     100
+}
+
+fn default_thunder_capacity_poll_interval_secs() -> u64 {
+    5
 }
 
 impl PolicyConfig {

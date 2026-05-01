@@ -16,13 +16,13 @@
 //! - Pause/resume + BFD + force-timeout → P6
 //! - `ProgramRequestGuard` RAII → P6
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
 
-use super::{LoadBalancingPolicy, SelectWorkerInfo};
+use super::{thunder_metrics, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
 /// Sub-mode selector. Phase 3 only implements `Default`. `Tr` (transactional)
@@ -46,6 +46,9 @@ pub struct ThunderConfig {
     pub resume_timeout_secs: u64,
     /// Tick interval for the scheduler task (P6+).
     pub scheduler_tick_ms: u64,
+    /// Period between `/get_server_info` capacity fetches against each
+    /// backend, in seconds. P4+: drives `BackendState.capacity_tokens`.
+    pub capacity_poll_interval_secs: u64,
 }
 
 impl Default for ThunderConfig {
@@ -55,6 +58,7 @@ impl Default for ThunderConfig {
             capacity_reserved_fraction: 0.10,
             resume_timeout_secs: 1800,
             scheduler_tick_ms: 100,
+            capacity_poll_interval_secs: 5,
         }
     }
 }
@@ -165,13 +169,83 @@ impl RouterState {
 pub struct ThunderPolicy {
     config: ThunderConfig,
     state: Arc<RwLock<RouterState>>,
+    /// Backend capacity fetcher. Held so tests can inject a mock; production
+    /// uses `HttpMetricsClient`. The poll task receives a clone — this field
+    /// stays so the policy can be `Debug` and so future code paths (P5+ TR
+    /// admission gate) can call `metrics_client.fetch_capacity` synchronously.
+    #[expect(
+        dead_code,
+        reason = "owned by the spawned poll task via clone; field kept for Debug + future direct use in P5+"
+    )]
+    metrics_client: Arc<dyn thunder_metrics::MetricsClient>,
 }
 
 impl ThunderPolicy {
+    /// Construct a `ThunderPolicy` backed by `HttpMetricsClient` (production path).
     pub fn new(config: ThunderConfig) -> Self {
+        Self::with_metrics_client(
+            config,
+            Arc::new(thunder_metrics::HttpMetricsClient) as Arc<dyn thunder_metrics::MetricsClient>,
+        )
+    }
+
+    /// Construct a `ThunderPolicy` with a caller-provided metrics client.
+    /// Used by tests to inject a mock without spinning up an HTTP server.
+    ///
+    /// **Side effects:** spawns a `tokio::task` that polls each known backend
+    /// every `config.capacity_poll_interval_secs` seconds and updates
+    /// `BackendState.capacity_tokens`. The task holds a `Weak<RwLock<RouterState>>`
+    /// reference to break the would-be Arc cycle so the policy can drop cleanly
+    /// — when `upgrade()` returns `None` (policy dropped), the task exits.
+    pub fn with_metrics_client(
+        config: ThunderConfig,
+        metrics_client: Arc<dyn thunder_metrics::MetricsClient>,
+    ) -> Self {
+        let state = Arc::new(RwLock::new(RouterState::default()));
+        let poll_secs = config.capacity_poll_interval_secs.max(1);
+        let state_for_poll = Arc::downgrade(&state);
+        let mc_for_poll = metrics_client.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fire-and-forget capacity poller — exits cleanly when ThunderPolicy is dropped (Weak::upgrade returns None)"
+        )]
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(poll_secs));
+            loop {
+                interval.tick().await;
+                let Some(state_arc) = state_for_poll.upgrade() else {
+                    debug!("ThunderPolicy state dropped; capacity poll task exiting");
+                    return;
+                };
+                let urls: Vec<String> = {
+                    let guard = state_arc.read().await;
+                    guard.backends.keys().cloned().collect()
+                };
+                for url in urls {
+                    match mc_for_poll.fetch_capacity(&url).await {
+                        Ok(cap) => {
+                            let mut guard = state_arc.write().await;
+                            if let Some(b) = guard.backends.get_mut(&url) {
+                                b.capacity_tokens = cap.capacity_tokens;
+                            }
+                            trace!(
+                                worker_url = %url,
+                                capacity_tokens = cap.capacity_tokens,
+                                "capacity refreshed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(worker_url = %url, error = %e, "capacity fetch failed");
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
             config,
-            state: Arc::new(RwLock::new(RouterState::default())),
+            state,
+            metrics_client,
         }
     }
 

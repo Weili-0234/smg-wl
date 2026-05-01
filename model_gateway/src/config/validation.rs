@@ -471,6 +471,7 @@ impl ConfigValidator {
                 capacity_reserved_fraction,
                 resume_timeout_secs: _,
                 scheduler_tick_ms,
+                capacity_poll_interval_secs,
             } => {
                 let sm = sub_mode.to_lowercase();
                 if sm != "default" && sm != "tr" {
@@ -491,6 +492,13 @@ impl ConfigValidator {
                     return Err(ConfigError::InvalidValue {
                         field: "thunder.scheduler_tick_ms".to_string(),
                         value: scheduler_tick_ms.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+                if *capacity_poll_interval_secs == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "thunder.capacity_poll_interval_secs".to_string(),
+                        value: capacity_poll_interval_secs.to_string(),
                         reason: "Must be > 0".to_string(),
                     });
                 }

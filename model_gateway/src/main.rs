@@ -209,6 +209,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 100, help_heading = "Thunder Policy")]
     thunder_scheduler_tick_ms: u64,
 
+    /// Period between backend capacity-refresh polls in seconds (P4+).
+    #[arg(long, default_value_t = 5, help_heading = "Thunder Policy")]
+    thunder_capacity_poll_interval_secs: u64,
+
     /// Enable data parallelism aware scheduling
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_aware: bool,
@@ -952,6 +956,7 @@ impl CliArgs {
                 capacity_reserved_fraction: self.thunder_capacity_reserved_fraction,
                 resume_timeout_secs: self.thunder_resume_timeout_secs,
                 scheduler_tick_ms: self.thunder_scheduler_tick_ms,
+                capacity_poll_interval_secs: self.thunder_capacity_poll_interval_secs,
             },
             _ => PolicyConfig::RoundRobin,
         }

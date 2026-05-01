@@ -77,6 +77,7 @@ impl PolicyFactory {
                 capacity_reserved_fraction,
                 resume_timeout_secs,
                 scheduler_tick_ms,
+                capacity_poll_interval_secs,
             } => {
                 let sub_mode = match sub_mode.to_lowercase().as_str() {
                     "default" => super::thunder::ThunderSubMode::Default,
@@ -94,6 +95,7 @@ impl PolicyFactory {
                     capacity_reserved_fraction: *capacity_reserved_fraction,
                     resume_timeout_secs: *resume_timeout_secs,
                     scheduler_tick_ms: *scheduler_tick_ms,
+                    capacity_poll_interval_secs: *capacity_poll_interval_secs,
                 };
                 Arc::new(ThunderPolicy::new(cfg))
             }
@@ -168,6 +170,7 @@ mod tests {
             capacity_reserved_fraction: 0.10,
             resume_timeout_secs: 1800,
             scheduler_tick_ms: 100,
+            capacity_poll_interval_secs: 5,
         });
         assert_eq!(policy.name(), "thunder");
     }
