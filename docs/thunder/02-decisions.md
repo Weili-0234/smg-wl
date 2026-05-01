@@ -1,0 +1,34 @@
+> Part of the [Thunder Policy spec](00-INDEX.md). Companion: [worklog](worklog.md) — design decisions with revisit conditions.
+
+# Thunder — Decision Log (SIGNED-OFF)
+
+## 2. Decision log (SIGNED-OFF)
+
+Every algorithmic deviation from Python ThunderAgent maps to one row here. Implementation MUST cite the row when introducing the deviation. Anything not on this list and that diverges from Python is unauthorized scope expansion — pause and brainstorm.
+
+| # | Topic | Type | Decision | Task ID |
+|---|---|---|---|---|
+| 2.1 | Concurrency: single `Arc<RwLock<RouterState>>` | FAITHFUL | Cooperative-asyncio semantics preserved as physical RwLock guards. **Hard rule: no `.await` in guard.** | #1 |
+| 2.2 | Observability via SMG `metrics!` macros + `as_any()` downcast for endpoints | DESIGN | New series `smg_thunder_*`; thunder also calls `Metrics::record_router_*` so it appears in shared dashboards. `/thunder/programs`, `/thunder/profiles` mounted in `build_app` via downcast on `Arc<dyn LoadBalancingPolicy>`. | #2 |
+| 2.3 | (Old 5a/5b refactor split) | SUPERSEDED | Thunder is a policy, not a router. Phase plan re-derived in §11. | #3, #4 |
+| 2.4 | Q5.1 — Resume timeout configurable | FORK (limited) | Python hardcodes 1800s; Rust adds `--thunder-resume-timeout-secs`, default 1800 (matches Python actual code, not its doc-string mistake). | #10 |
+| 2.5 | Q5.2 — Missing `program_id` → fallback to literal `"default"` | FAITHFUL | Plus `tracing::warn!` once-per-session + `smg_thunder_program_id_missing_total` counter. | #8 |
+| 2.6 | Q5.3 — `shared_tokens` enable + initial value | FORK (call site only) + FAITHFUL (init) | Python defines `update_shared_tokens()` but never calls it → effective `shared_tokens ≡ 0`. Rust scheduler tick CALLS it (FORK). Formula verbatim. Initial value = 0 (FAITHFUL state.py:54). No mitigations (no EMA, no smoothing). | #9, #14 |
+| 2.7 | Q5.4 — RAII `ProgramRequestGuard` for streaming-cancel cleanup | FORK | Python's `finally` block doesn't always run on client disconnect → leak. Rust uses RAII Drop with idempotent `force_terminate_program`; success path explicit `complete()` to no-op the Drop. | #7 |
+| 2.8 | Q5.5 — `char_to_token_ratio` momentum on both streaming and non-streaming | FAITHFUL | Initial 5.0. First sample direct-assign. Subsequent: `0.2*new + 0.8*old`. Both paths feed `prompt_tokens` from `usage` block; if `usage` absent, skip + debug log. | #11 |
+| 2.9 | Q5.6 — Multi-worker default-mode selection (least active count) | FAITHFUL | Picks backend with fewest active programs. Implemented in default sub-mode lifecycle phase. | #12 |
+| 2.10 | Q5.7 — Detailed footgun catalog | DOC POLICY | §10 enumerates known shared_tokens instability sources with trigger / observable / inspection. **No code-level mitigations.** | #13 |
+| 2.11 | (Old §10.2 RouterManager accessor concern) | SUPERSEDED | Policy pivot removes need for any RouterManager downcast. | #15 |
+| 2.12 | (Old §10.3 two-layer streaming token counting) | SUPERSEDED | Mid-stream tracking dropped; only end-of-stream usage matters. | #16 |
+| 2.13 | Multi-protocol scope: OpenAI Chat / OpenAI Responses / Anthropic Messages on internal backends only | SCOPE | Generation endpoints in scope: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, `/generate`. **OUT of scope**: external API workers (`RuntimeType::External` — these route via `HTTP_OPENAI`/`HTTP_ANTHROPIC`/`HTTP_GEMINI` which bypass policy via `WorkerSelector`). Also out: `/v1/embeddings`, `/v1/classify`, `/v1/rerank`, `/v1/audio/*`, `/v1/realtime/*`, `/v1/interactions`. Backend deployment ensures each URL serves all 3 generation protocols (`/v1/chat/completions` natively, `/v1/messages` + `/v1/responses` via litellm-proxy sidecar in front of vLLM/sglang). | #17 |
+| 2.14 | **MAJOR PIVOT**: thunder = `LoadBalancingPolicy` (not `RoutingMode`) | ARCHITECTURE | Replaces the old `routers/thunder/` approach. Coverage via `LoadBalancingPolicy::select_worker_async` on `HTTP_REGULAR` / `GRPC_REGULAR` routers (per §3.3 scope; `WorkerSelector::find_best_worker` 3rd-party-style path explicitly NOT integrated). | #18 |
+| 2.15 | Trait extension: add `async fn select_worker_async` with default fallback | API | Default impl forwards to sync `select_worker`. 8 existing policies inherit unchanged. | #19 |
+| 2.16 | `SelectWorkerInfo` extension: add `pub program_id: Option<&'a str>` | API | 8 existing policies don't read it. Routers populate when thunder is active. | #20 |
+| 2.17 | Streaming tracking simplification: end-of-stream usage only | FAITHFUL (matches Python end-of-stream overwrite at router.py:408) | No mid-stream counter; no mpsc relay rewrite needed. | #21 |
+| 2.18 | Cross-protocol capacity counting | DEPLOYMENT (simplified) | Internal worker registered ONCE per URL (`RuntimeType::Vllm`/`Sglang`/...). Backend serves all 3 protocols (sidecar). SMG dispatch (`router_manager.rs:223-228`) routes ALL three protocols to the SAME `HTTP_REGULAR` (or `GRPC_REGULAR`) router → SAME policy → SAME `BackendState` keyed by URL → cross-protocol capacity aggregates automatically. No dual-registration needed. F-DC1..F-DC4 from prior brainstorm dropped (External-only concerns). | #22 |
+| 2.19 | **D-1**: HTTP path needs minimal SSE tail extractor + `stream_options.include_usage=true` injection (rescoped) | NEW SCOPE | `routers/http/router.rs:697,908` streaming branches are pure `bytes_stream()` forwards with NO usage parsing. Thunder needs `usage.{prompt,completion,total,cached}_tokens` end-of-stream. Implementation: ~80-line SSE inspector wrapping the bytes_stream; gateway-side body mutation injects `stream_options.include_usage=true` when policy is thunder + streaming (faithful Python `vllm_request_processor.py:138-143`). Wraps applies to all 3 protocols since they share `route_typed_request`. The OpenAI Chat / Anthropic 3rd-party-style routers are out of scope (§3.3). | #27 |
+| 2.20 | **D-2**: Hook mechanism — optional trait method `usage_sender(&self) -> Option<&UnboundedSender<UsageEvent>>` | API | Default returns `None` (8 existing policies inherit). Routers always call; `if let Some(tx) = ...` short-circuits when policy doesn't use it. Avoids downcast boilerplate in routers. | #28 (new) |
+| 2.21 | **D-3**: Keep Q1 single mutex; document performance footgun | FAITHFUL | Reject the DashMap split mitigation — it would break Python's atomic-region semantics. If hot path benchmarks contend, FIRST upgrade to `parking_lot::RwLock` (OS-syscall-free); only THEN consider lock-split as a separate FORK with race-free audit. | #29 (new) |
+| 2.22 | **D-4**: PolicyConfig::Thunder default values | CONFIG | `sub_mode = Default` (typed enum, not String). `scheduler_interval_secs = 5`. `resume_timeout_secs = 1800`. `tool_coefficient = 0.5`. `use_acting_token_decay = false`. | #30 (new) |
+
+---
