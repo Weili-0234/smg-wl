@@ -961,3 +961,17 @@ Program lifecycle state machine added: `ProgramStatus { Idle, Reasoning, Acting,
 `check_marked_for_pause` helper applied at end-of-stream / response completion (call sites lit up in M5+M6 when Acting-state transitions wire through).
 
 **Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.4
+
+## D-33..D-34 (2026-05-01): Phase 7 M5+M6 — BFD greedy_resume + targeted notify
+
+`<SIGNED-OFF>` Scheduler tick now runs `try_greedy_resume` after `proactive_pause_pass`. Sort PAUSED programs DESC by total_tokens (Python BFD step a; floor 100); sort backends DESC by remaining capacity per program iteration (BFD step b/c). For each program, find the first backend that fits and `wake_program_to`; programs that don't fit stay paused for next tick.
+
+**D-33**: BFD inside scheduler_tick_task; per-program backend re-sort to handle decrementing remaining capacity as assignments accumulate.
+
+**D-34**: Starvation mitigation via priority boost: programs paused longer than `PAUSED_PRIORITY_BOOST_AFTER` (900s = half of force_resume_timeout) are sorted ahead of larger programs. Combined with existing `force_admit_after_timeout` at 1800s, gives two-tier protection.
+
+**M6**: `wake_program_to` uses targeted `notify_one()` (not broadcast). Existing broadcasts in `usage_consumer_task` and Drop fallback retained as defense-in-depth for cases scheduler hasn't ticked yet — they're now no-ops in steady state since BFD makes the assignment.
+
+**pick_tr** detects BFD-pre-reserved programs (estimated_reserved_tokens > 0 AND backend_url matches chosen) and skips re-reservation — prevents double-booking of capacity when scheduler woke the program before pick_tr re-acquires lock.
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.5, §3.6

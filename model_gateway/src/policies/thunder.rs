@@ -49,6 +49,11 @@ const CALIBRATION_HALF_LIFE: Duration = Duration::from_secs(3600);
 /// Fallback completion budget when no `declared_max_tokens` is present in the
 /// request (e.g., legacy clients omitting `max_tokens`).
 const FALLBACK_COMPLETION_TOKENS: u64 = 256;
+/// M5 starvation mitigation: Paused programs older than this get priority-
+/// boosted ahead of larger programs in BFD ordering. Default = half of the
+/// force_resume_timeout (1800s default), so a program waits ≤ 900s before
+/// gaining priority and ≤ 1800s before force-admit kicks in.
+const PAUSED_PRIORITY_BOOST_AFTER: Duration = Duration::from_secs(900);
 
 /// Decay-weighted EMA update for a calibration value. Decays the previously
 /// stored value toward `neutral` based on wall-time elapsed since `last_at`,
@@ -320,6 +325,87 @@ impl RouterState {
         self.waiting_events
             .entry(pid.to_string())
             .or_insert_with(|| Arc::new(Notify::new()));
+    }
+
+    /// M5: BFD greedy_resume. Sort PAUSED programs DESC by total_tokens
+    /// (Python BFD step a), iterate. For each program, find the backend
+    /// with the most remaining capacity that fits the program's estimated
+    /// resume tokens (BFD step c). Wake via targeted `notify_one()` (M6).
+    /// Programs that don't fit anywhere stay PAUSED for next tick.
+    ///
+    /// Starvation mitigation: programs paused longer than
+    /// `PAUSED_PRIORITY_BOOST_AFTER` get sorted ahead of larger programs.
+    fn try_greedy_resume(&mut self) {
+        let now = Instant::now();
+        let mut paused: Vec<(String, u64, Option<Instant>)> = self
+            .programs
+            .iter()
+            .filter(|(_, p)| p.status == ProgramStatus::Paused)
+            .map(|(pid, p)| {
+                // Use known total_tokens (program's history); floor at 100 for
+                // freshly-paused programs that haven't completed any request.
+                let est = p.total_tokens.max(100);
+                (pid.clone(), est, p.paused_at)
+            })
+            .collect();
+
+        paused.sort_by(|(_, a_est, a_paused), (_, b_est, b_paused)| {
+            let a_priority = a_paused
+                .map(|t| now.saturating_duration_since(t) > PAUSED_PRIORITY_BOOST_AFTER)
+                .unwrap_or(false);
+            let b_priority = b_paused
+                .map(|t| now.saturating_duration_since(t) > PAUSED_PRIORITY_BOOST_AFTER)
+                .unwrap_or(false);
+            match (a_priority, b_priority) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => b_est.cmp(a_est),
+            }
+        });
+
+        let urls: Vec<String> = self.backends.keys().cloned().collect();
+
+        for (pid, est, _) in paused {
+            // Re-fetch sorted backends per iteration since assignments
+            // mutate remaining capacity.
+            let mut by_remaining: Vec<(String, u64)> = urls
+                .iter()
+                .map(|u| {
+                    let remaining = self
+                        .backends
+                        .get(u)
+                        .map(|b| b.capacity_tokens.saturating_sub(b.active_program_tokens))
+                        .unwrap_or(0);
+                    (u.clone(), remaining)
+                })
+                .collect();
+            by_remaining.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+
+            for (url, remaining) in &by_remaining {
+                if *remaining >= est {
+                    self.wake_program_to(&pid, url, est);
+                    break;
+                }
+            }
+            // No fit → stays Paused for next tick.
+        }
+    }
+
+    /// M5+M6: assign a paused program to a backend and targeted-notify it.
+    fn wake_program_to(&mut self, pid: &str, backend_url: &str, estimated: u64) {
+        if let Some(p) = self.programs.get_mut(pid) {
+            p.backend_url = Some(backend_url.to_string());
+            p.status = ProgramStatus::Reasoning;
+            p.estimated_reserved_tokens = estimated;
+            p.paused_at = None;
+        }
+        if let Some(b) = self.backends.get_mut(backend_url) {
+            b.active_program_tokens = b.active_program_tokens.saturating_add(estimated);
+            b.active_programs.insert(pid.to_string());
+        }
+        if let Some(notify) = self.waiting_events.get(pid) {
+            notify.notify_one(); // ★ M6: targeted, not broadcast
+        }
     }
 
     /// M4: scheduler tick body. Iterates backends; for each over the
@@ -667,7 +753,7 @@ impl ThunderPolicy {
                 };
                 let mut guard = state_arc.write().await;
                 guard.proactive_pause_pass(reserved_fraction);
-                // M5 BFD resume integration goes here.
+                guard.try_greedy_resume(); // M5 BFD greedy_resume + M6 targeted notify
             }
         });
 
@@ -1021,28 +1107,43 @@ impl ThunderPolicy {
                     return None; // no backends in registry
                 };
 
-                if state.has_capacity(
-                    &chosen_url,
-                    estimated_tokens,
-                    self.config.capacity_reserved_fraction,
-                ) {
+                // M5: detect BFD-pre-reserved program (wake_program_to already
+                // booked the backend on our behalf). Skip the duplicate reservation
+                // but still bump in_flight/step_count via assign().
+                let already_reserved = state
+                    .programs
+                    .get(&program_id)
+                    .map(|p| {
+                        p.estimated_reserved_tokens > 0
+                            && p.backend_url.as_deref() == Some(chosen_url.as_str())
+                    })
+                    .unwrap_or(false);
+
+                if already_reserved
+                    || state.has_capacity(
+                        &chosen_url,
+                        estimated_tokens,
+                        self.config.capacity_reserved_fraction,
+                    )
+                {
                     let idx = workers.iter().position(|w| w.url() == chosen_url)?;
                     state.assign(&program_id, &chosen_url);
-                    // Reserve the estimate so concurrent arrivals to the
-                    // same backend see the load and pause.
-                    if let Some(b) = state.backends.get_mut(&chosen_url) {
-                        b.active_program_tokens =
-                            b.active_program_tokens.saturating_add(estimated_tokens);
-                    }
-                    if let Some(p) = state.programs.get_mut(&program_id) {
-                        p.estimated_reserved_tokens = p
-                            .estimated_reserved_tokens
-                            .saturating_add(estimated_tokens);
+                    if !already_reserved {
+                        if let Some(b) = state.backends.get_mut(&chosen_url) {
+                            b.active_program_tokens =
+                                b.active_program_tokens.saturating_add(estimated_tokens);
+                        }
+                        if let Some(p) = state.programs.get_mut(&program_id) {
+                            p.estimated_reserved_tokens = p
+                                .estimated_reserved_tokens
+                                .saturating_add(estimated_tokens);
+                        }
                     }
                     debug!(
                         program_id = %program_id,
                         backend = %chosen_url,
                         est = estimated_tokens,
+                        bfd_resumed = already_reserved,
                         "thunder TR admit"
                     );
                     return Some(idx);
@@ -1688,6 +1789,166 @@ mod tests {
             elapsed < Duration::from_secs(3),
             "force-admit should not wait significantly past timeout (took {elapsed:?})"
         );
+    }
+
+    // ===== M5+M6 BFD greedy_resume + targeted notify tests =====
+
+    #[test]
+    fn bfd_assigns_largest_program_to_most_remaining_backend() {
+        let mut state = RouterState::default();
+        state.backends.insert(
+            "A".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 200,
+            },
+        );
+        state.backends.insert(
+            "B".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 100,
+            },
+        );
+        for (pid, total) in [("p_big", 150), ("p_small", 50)] {
+            let mut prog = Program::new(pid.to_string());
+            prog.status = ProgramStatus::Paused;
+            prog.total_tokens = total;
+            prog.paused_at = Some(Instant::now());
+            state.programs.insert(pid.to_string(), prog);
+            state
+                .waiting_events
+                .insert(pid.to_string(), Arc::new(Notify::new()));
+        }
+        state.try_greedy_resume();
+        // p_big (150) → A (cap 200, fits) ; p_small (50) → A (200-150=50, fits) or B (100, fits)
+        // BFD picks A first (most remaining); after assigning p_big, A has 50 free.
+        // For p_small (50): re-sort backends → B has 100 free vs A has 50 → both fit;
+        // pick B (DESC sort).
+        let p_big = state.programs.get("p_big").unwrap();
+        let p_small = state.programs.get("p_small").unwrap();
+        assert_eq!(p_big.status, ProgramStatus::Reasoning);
+        assert_eq!(p_big.backend_url.as_deref(), Some("A"));
+        assert_eq!(p_small.status, ProgramStatus::Reasoning);
+        assert!(p_small.backend_url.is_some(), "p_small assigned somewhere");
+    }
+
+    #[test]
+    fn bfd_skips_program_that_doesnt_fit_anywhere() {
+        let mut state = RouterState::default();
+        state.backends.insert(
+            "A".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 100,
+            },
+        );
+        let mut prog = Program::new("p_huge".to_string());
+        prog.status = ProgramStatus::Paused;
+        prog.total_tokens = 10_000; // doesn't fit in 100
+        state.programs.insert("p_huge".to_string(), prog);
+        state
+            .waiting_events
+            .insert("p_huge".to_string(), Arc::new(Notify::new()));
+        state.try_greedy_resume();
+        // p_huge stays Paused
+        assert_eq!(
+            state.programs.get("p_huge").unwrap().status,
+            ProgramStatus::Paused
+        );
+    }
+
+    #[test]
+    fn bfd_prioritizes_long_paused_program_for_starvation_mitigation() {
+        // Backend has room for exactly ONE of the two paused programs. p_new is
+        // larger (would normally win BFD ordering) but p_old has been paused
+        // long enough to get priority-boosted. p_old should resume first; p_new
+        // stays paused for next tick.
+        let mut state = RouterState::default();
+        state.backends.insert(
+            "A".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 250,
+            },
+        );
+        let mut p_old = Program::new("old".to_string());
+        p_old.status = ProgramStatus::Paused;
+        p_old.total_tokens = 200; // small enough to fit alone
+        p_old.paused_at = Some(Instant::now() - PAUSED_PRIORITY_BOOST_AFTER - Duration::from_secs(1));
+        state.programs.insert("old".to_string(), p_old);
+        state
+            .waiting_events
+            .insert("old".to_string(), Arc::new(Notify::new()));
+
+        let mut p_new = Program::new("new".to_string());
+        p_new.status = ProgramStatus::Paused;
+        p_new.total_tokens = 220; // larger but fresh — would lose priority to p_old
+        p_new.paused_at = Some(Instant::now());
+        state.programs.insert("new".to_string(), p_new);
+        state
+            .waiting_events
+            .insert("new".to_string(), Arc::new(Notify::new()));
+
+        state.try_greedy_resume();
+        // p_old wins via priority boost; takes 200 of 250.
+        assert_eq!(
+            state.programs.get("old").unwrap().status,
+            ProgramStatus::Reasoning,
+            "old (priority-boosted) should resume"
+        );
+        // p_new (220) doesn't fit in remaining 50 → stays paused.
+        assert_eq!(
+            state.programs.get("new").unwrap().status,
+            ProgramStatus::Paused,
+            "new stays paused — old got the slot via priority"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_program_to_uses_targeted_notify_one() {
+        // Validate that wake_program_to fires the program's specific Notify
+        // (M6 targeted wake, not broadcast). Use a Notify and observe via
+        // tokio::sync::Notify::notified() future polling.
+        let mut state = RouterState::default();
+        state.backends.insert(
+            "A".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 200,
+            },
+        );
+        let notify = Arc::new(Notify::new());
+        state
+            .waiting_events
+            .insert("p1".to_string(), notify.clone());
+        let mut prog = Program::new("p1".to_string());
+        prog.status = ProgramStatus::Paused;
+        state.programs.insert("p1".to_string(), prog);
+
+        // Spawn a waiter that registers AFTER state setup.
+        let n_clone = notify.clone();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test harness; the waiter's lifetime is bounded by tokio::time::timeout"
+        )]
+        let waiter = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_millis(200), n_clone.notified())
+                .await
+                .is_ok()
+        });
+        // Yield to let the waiter register before wake.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        state.wake_program_to("p1", "A", 50);
+
+        let woken = waiter.await.unwrap();
+        assert!(woken, "wake_program_to must fire the targeted notify_one");
     }
 
     // ===== M4 proactive pause tests =====
