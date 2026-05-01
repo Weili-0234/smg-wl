@@ -464,3 +464,37 @@ Weili Xu, 2026-04-30 session ("好，就用 Option α").
 ### Approved by
 
 (Pending P1 implementation commit + Claude review + user sign-off.)
+
+---
+
+## D-18: P2 implementation completed — multi-protocol mock + smoke test
+
+**Date**: 2026-05-01
+**Spec ref**: `docs/thunder/10-phases.md` P2 row
+**Approval mode**: <CLAUDE-AUTONOMOUS-DECISION> — Claude authored plan + reviewed work; user sign-off pending.
+
+### What landed
+
+- `mock_vllm.py`: `/v1/responses` POST handler (~50 LOC) returning OpenAI chat.completion shape with `_mock_endpoint` and `_mock_echo_program_id` fields
+- `test_phase2_multi_protocol_smoke.py`: 4 test cases proving SMG routes all 3 protocols to same backend under `--policy cache_aware`
+
+### What did NOT change
+
+- Zero Rust file modified — P2 is Python-only
+- Conftest reused unchanged — same `smg_router` fixture from P0
+- ThunderPolicy not yet in scope (P3)
+
+### Autonomous decisions made
+
+1. **Reuse P0's `smg_router` fixture** unchanged rather than creating a new P2-specific fixture. Rationale: same SMG binary, same `--policy cache_aware` flag, no per-phase fixture state. If user prefers per-phase fixture isolation, easy to revisit later.
+2. **Mock returns OpenAI chat.completion shape for /v1/responses** rather than the canonical OpenAI Responses API shape. Rationale: matches what litellm-proxy produces (Responses-in → Chat-in upstream → Chat-out). SMG just byte-stream-forwards. If real OpenAI Responses shape becomes a P3+ test requirement, mock can be extended.
+3. **No Phase 2 streaming test**. Rationale: streaming SSE shape varies across the 3 protocols (chat: bare data:; messages: event+data; responses: ad-hoc). P3 will tackle streaming-aware routing; P2 stays non-streaming for surface clarity.
+
+### Revisit conditions
+
+1. If real-world responses-shape compliance is needed → extend mock with proper Responses payload.
+2. If streaming behavior diverges across protocols in production → add P2.5 streaming smoke.
+
+### Approved by
+
+(Pending user review.)
