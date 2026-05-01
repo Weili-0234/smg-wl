@@ -5,8 +5,10 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+use async_trait::async_trait;
 use openai_protocol::worker::WorkerLoadResponse;
 use smg_mesh::OptionalMeshSyncManager;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::worker::{HashRing, Worker};
 
@@ -67,6 +69,7 @@ pub struct UsageEvent {
 ///
 /// This trait provides a unified interface for implementing routing algorithms
 /// that can work with both regular single-worker selection and PD dual-worker selection.
+#[async_trait]
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
@@ -115,6 +118,35 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
 
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Async variant of `select_worker`. The default implementation delegates
+    /// to `select_worker` so existing policies keep working unchanged. Policies
+    /// that need to do async work during selection (e.g., ThunderPolicy
+    /// awaiting a per-program Notify after a pause) override this method.
+    ///
+    /// ## Why both sync and async?
+    ///
+    /// Most policies (cache_aware, round_robin, etc.) make selection decisions
+    /// from in-memory state and don't need `.await`. Forcing them to be async
+    /// would add overhead and complicate their tests. ThunderPolicy is the
+    /// outlier — it may pause selection until capacity frees — and it's the
+    /// only thing that overrides the default.
+    async fn select_worker_async(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        info: &SelectWorkerInfo<'_>,
+    ) -> Option<usize> {
+        self.select_worker(workers, info)
+    }
+
+    /// Optional usage-event sender. Routers fire-and-forget a `UsageEvent`
+    /// after the upstream stream completes. Stateless policies return `None`
+    /// (the default) and routers short-circuit the send. ThunderPolicy returns
+    /// `Some(&self.usage_tx)` so it can update `BackendState.active_program_tokens`
+    /// and per-program `char_to_token_ratio`.
+    fn usage_sender(&self) -> Option<&UnboundedSender<UsageEvent>> {
+        None
+    }
 }
 
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
@@ -292,5 +324,66 @@ mod tests {
     fn select_worker_info_default_program_id_is_none() {
         let info = SelectWorkerInfo::default();
         assert_eq!(info.program_id, None);
+    }
+
+    #[tokio::test]
+    async fn select_worker_async_default_delegates_to_sync() {
+        struct Stub;
+        impl Debug for Stub {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Stub")
+            }
+        }
+        #[async_trait::async_trait]
+        impl LoadBalancingPolicy for Stub {
+            fn select_worker(
+                &self,
+                workers: &[Arc<dyn Worker>],
+                _info: &SelectWorkerInfo,
+            ) -> Option<usize> {
+                if workers.is_empty() { None } else { Some(0) }
+            }
+            fn name(&self) -> &'static str {
+                "stub"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let stub = Stub;
+        let workers: Vec<Arc<dyn Worker>> = vec![];
+        let info = SelectWorkerInfo::default();
+        // Default async impl must delegate to sync — same answer for empty + non-empty.
+        let sync_result = stub.select_worker(&workers, &info);
+        let async_result = stub.select_worker_async(&workers, &info).await;
+        assert_eq!(sync_result, async_result);
+    }
+
+    #[test]
+    fn usage_sender_default_returns_none() {
+        struct Stub;
+        impl Debug for Stub {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Stub")
+            }
+        }
+        #[async_trait::async_trait]
+        impl LoadBalancingPolicy for Stub {
+            fn select_worker(
+                &self,
+                _workers: &[Arc<dyn Worker>],
+                _info: &SelectWorkerInfo,
+            ) -> Option<usize> {
+                None
+            }
+            fn name(&self) -> &'static str {
+                "stub"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let stub = Stub;
+        assert!(stub.usage_sender().is_none());
     }
 }
