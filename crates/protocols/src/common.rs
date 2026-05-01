@@ -866,9 +866,15 @@ mod tests {
     fn program_id_hint_default_returns_none() {
         struct Stub;
         impl GenerationRequest for Stub {
-            fn is_stream(&self) -> bool { false }
-            fn get_model(&self) -> Option<&str> { None }
-            fn extract_text_for_routing(&self) -> String { String::new() }
+            fn is_stream(&self) -> bool {
+                false
+            }
+            fn get_model(&self) -> Option<&str> {
+                None
+            }
+            fn extract_text_for_routing(&self) -> String {
+                String::new()
+            }
         }
         assert_eq!(Stub.program_id_hint(), None);
     }
