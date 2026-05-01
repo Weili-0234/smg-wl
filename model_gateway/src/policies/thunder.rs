@@ -391,6 +391,14 @@ impl ThunderPolicy {
         Self::new(ThunderConfig::default())
     }
 
+    /// Create a `ProgramRequestGuard` for `program_id`. Held by the router for
+    /// the lifetime of an in-flight request — on `Drop` (cancel / error /
+    /// dropped future) it asynchronously decrements `Program.in_flight` and
+    /// broadcasts the per-program `Notify` so paused requests can re-check.
+    pub fn create_guard(&self, program_id: &str) -> ProgramRequestGuard {
+        ProgramRequestGuard::new(self.state.clone(), program_id.to_string())
+    }
+
     /// Test/admin accessor — clones the current state for read-only inspection.
     /// (Used by Phase 8's `/thunder/programs` admin endpoint when it lands.)
     pub async fn snapshot_state(&self) -> RouterState {
@@ -403,6 +411,92 @@ impl ThunderPolicy {
             // the type symmetric.
             waiting_events: guard.waiting_events.clone(),
         }
+    }
+}
+
+/// RAII guard tracking a request's in-flight lifetime in `ThunderPolicy`.
+///
+/// **Lifecycle:** Created by `ThunderPolicy::create_guard` after a successful
+/// `select_worker_async` admit, held by the router for the duration of the
+/// upstream call.
+///
+/// **Drop semantics (D-22 simplification):** if the guard is dropped without
+/// a prior `complete()` call, an async cleanup task is spawned that:
+///   1. Decrements `Program.in_flight` (so admission accounting stays sane
+///      even if the client cancels mid-request).
+///   2. Broadcasts every `Notify` in `waiting_events` (a slot may have just
+///      freed).
+///
+/// Calling `complete()` *suppresses* the cleanup — used on the happy path
+/// where `usage_consumer` already handled in-flight decrement via the
+/// matching `UsageEvent`.
+///
+/// ★ Decision tag (autonomous): `Drop` is sync but the `RouterState` lock is
+/// async, so the cleanup is `tokio::spawn`ed. We capture `Weak<RwLock<…>>`
+/// to avoid keeping the policy alive past its natural lifetime; if the
+/// policy was dropped before the cleanup runs, `upgrade()` returns `None`
+/// and the task exits.
+#[derive(Debug)]
+pub struct ProgramRequestGuard {
+    state: std::sync::Weak<RwLock<RouterState>>,
+    program_id: String,
+    completed: bool,
+}
+
+impl ProgramRequestGuard {
+    /// Construct a guard. Prefer `ThunderPolicy::create_guard`.
+    pub fn new(state: Arc<RwLock<RouterState>>, program_id: String) -> Self {
+        Self {
+            state: Arc::downgrade(&state),
+            program_id,
+            completed: false,
+        }
+    }
+
+    /// Mark the request as having completed via the normal `UsageEvent` path
+    /// (the consumer already decremented `in_flight`). Suppresses cleanup
+    /// on `Drop` so we don't double-decrement.
+    pub fn complete(&mut self) {
+        self.completed = true;
+    }
+
+    /// Test-only accessor for the program_id (avoids exposing the field).
+    #[cfg(test)]
+    pub fn program_id(&self) -> &str {
+        &self.program_id
+    }
+}
+
+impl Drop for ProgramRequestGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let Some(state) = self.state.upgrade() else {
+            return; // policy already dropped — nothing to clean up
+        };
+        let pid = std::mem::take(&mut self.program_id);
+        // `tokio::spawn` is fire-and-forget; matches the existing capacity-
+        // poll / usage-consumer fire-and-forget pattern in this file.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fire-and-forget cleanup task — exits when policy dropped via Weak::upgrade returning None"
+        )]
+        tokio::spawn(async move {
+            let mut guard = state.write().await;
+            if let Some(p) = guard.programs.get_mut(&pid) {
+                if p.in_flight > 0 {
+                    p.in_flight -= 1;
+                }
+            }
+            // A slot may have freed — broadcast so paused programs re-check.
+            let waiting: Vec<Arc<Notify>> = guard.waiting_events.values().cloned().collect();
+            drop(guard);
+            for n in &waiting {
+                n.notify_waiters();
+            }
+            trace!(program_id = %pid, "ProgramRequestGuard drop cleanup");
+        });
     }
 }
 
@@ -1087,6 +1181,77 @@ mod tests {
             .expect("must resume within 5s")
             .expect("task must not panic");
         assert_eq!(result, Some(0), "blocked program must admit on resume");
+    }
+
+    /// `ProgramRequestGuard::Drop` decrements `Program.in_flight` when the
+    /// guard is not marked complete (cancel / error path).
+    #[tokio::test]
+    async fn program_request_guard_drop_decrements_in_flight() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        let info = SelectWorkerInfo {
+            program_id: Some("guard-drop"),
+            ..Default::default()
+        };
+        // Admit once → in_flight = 1
+        let _ = policy.select_worker_async(&workers, &info).await;
+        let pre = policy.snapshot_state().await;
+        assert_eq!(pre.programs["guard-drop"].in_flight, 1);
+
+        // Drop a guard for the same program — async cleanup spawned.
+        {
+            let _g = policy.create_guard("guard-drop");
+        } // drop here
+        // Give the spawned task a moment to run.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let post = policy.snapshot_state().await;
+        assert_eq!(
+            post.programs["guard-drop"].in_flight, 0,
+            "guard Drop must decrement in_flight"
+        );
+    }
+
+    /// `ProgramRequestGuard::complete()` suppresses the Drop cleanup so the
+    /// happy path (where `usage_consumer` already decremented) doesn't
+    /// double-decrement.
+    #[tokio::test]
+    async fn program_request_guard_complete_suppresses_drop() {
+        let policy = ThunderPolicy::with_metrics_client(
+            ThunderConfig::default(),
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        );
+        let workers = mock_workers(1);
+        let info = SelectWorkerInfo {
+            program_id: Some("guard-complete"),
+            ..Default::default()
+        };
+        let _ = policy.select_worker_async(&workers, &info).await;
+        assert_eq!(
+            policy.snapshot_state().await.programs["guard-complete"].in_flight,
+            1
+        );
+        {
+            let mut g = policy.create_guard("guard-complete");
+            g.complete();
+        } // drop here — must NOT decrement
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            policy.snapshot_state().await.programs["guard-complete"].in_flight,
+            1,
+            "complete() must suppress Drop cleanup"
+        );
+    }
+
+    /// Guard exposes its program_id (test-only accessor).
+    #[test]
+    fn program_request_guard_exposes_program_id() {
+        let state = Arc::new(RwLock::new(RouterState::default()));
+        let g = ProgramRequestGuard::new(state, "pid-x".to_string());
+        assert_eq!(g.program_id(), "pid-x");
     }
 
     /// Force-admit-after-timeout fires when the deadline passes without

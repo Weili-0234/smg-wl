@@ -337,6 +337,22 @@ impl Router {
 
         let policy = self.policy_registry.get_policy_or_default(model_id);
 
+        // ★ Phase 5+6: ThunderPolicy admission accounting. We hold a
+        // `ProgramRequestGuard` for the lifetime of this function. On the
+        // happy non-streaming success path the guard's `complete()` is
+        // called below — `usage_consumer` already decrements `in_flight`
+        // when it applies the matching `UsageEvent`. On any other exit
+        // path (error, client cancel, streaming) the guard's `Drop` does
+        // an async fire-and-forget decrement so admission state stays
+        // consistent.
+        //
+        // The downcast is only enabled when policy is exactly Thunder; for
+        // any other policy the guard is `None` and incurs zero cost.
+        let mut thunder_guard = policy
+            .as_any()
+            .downcast_ref::<crate::policies::ThunderPolicy>()
+            .map(|tp| tp.create_guard(program_id_owned.as_deref().unwrap_or("default")));
+
         let load_guard = ["cache_aware", "manual"]
             .contains(&policy.name())
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
@@ -414,6 +430,12 @@ impl Router {
                                     total_tokens,
                                     request_text_chars: text.len(),
                                 });
+                                // Happy path: usage_consumer will handle
+                                // in_flight decrement. Suppress the guard's
+                                // Drop cleanup so we don't double-decrement.
+                                if let Some(g) = thunder_guard.as_mut() {
+                                    g.complete();
+                                }
                             }
                         }
                         return Response::from_parts(parts, Body::from(buf));
