@@ -949,3 +949,15 @@ Closed plan: `docs/superpowers/plans/2026-05-01-thunder-p5p6-capacity-pause-resu
 
 **Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.3
 **Plan**: docs/superpowers/plans/2026-05-01-thunder-phase7-m3-calibration.md
+
+## D-32 (2026-05-01): Phase 7 M4 — proactive pause + victim selection
+
+`<SIGNED-OFF>` Background scheduler tick task spawned in `ThunderPolicy::new` runs every `scheduler_tick_ms` (100ms default). On each tick, `proactive_pause_pass` iterates backends; for each over `active_program_tokens > capacity * (1 - reserved_fraction)`, picks lowest-step_count victim via `pick_victim` and applies `pause_until_safe`.
+
+Program lifecycle state machine added: `ProgramStatus { Idle, Reasoning, Acting, Paused }`, plus `marked_for_pause: bool` and `paused_at: Option<Instant>` fields.
+
+`pause_until_safe` semantics: if program currently Acting (mid-stream), set `marked_for_pause` for deferred pause at stream-end; else immediately Paused, un-reserve estimated_reserved_tokens, clear backend assignment, register Notify for wake.
+
+`check_marked_for_pause` helper applied at end-of-stream / response completion (call sites lit up in M5+M6 when Acting-state transitions wire through).
+
+**Spec**: docs/superpowers/specs/2026-05-01-thunder-phase7-production-design.md §3.4

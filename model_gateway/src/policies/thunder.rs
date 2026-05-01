@@ -120,6 +120,24 @@ impl Default for ThunderConfig {
     }
 }
 
+/// Lifecycle state of a Program in Thunder's algorithm (M4 — Python parity).
+///
+/// State transitions:
+/// - Idle → Reasoning: request admitted (select_worker returns)
+/// - Reasoning → Acting: first byte of upstream response received
+/// - Acting → Idle: stream end / non-stream response complete
+/// - Acting (with marked_for_pause) → Paused: deferred pause taken at stream end
+/// - Reasoning/Idle → Paused: scheduler picks as victim immediately
+/// - Paused → Reasoning: BFD greedy_resume picks for wake (M5)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProgramStatus {
+    #[default]
+    Idle,
+    Reasoning,
+    Acting,
+    Paused,
+}
+
 /// Per-program state tracked by Thunder.
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -130,22 +148,23 @@ pub struct Program {
     pub in_flight: u32,
     /// Cumulative tokens reported via UsageEvent (populated in P4+).
     pub total_tokens: u64,
-    /// Step counter — increments per admission. (Not yet used in P3.)
+    /// Step counter — increments per admission.
     pub step_count: u32,
-    /// Tokens this program has *reserved* on its backend at admit-time
-    /// (TR sub-mode, P5+). Un-reserved by `usage_consumer` when the actual
-    /// `UsageEvent` arrives so capacity accounting stays consistent across
-    /// the request lifetime.
+    /// Tokens this program has *reserved* on its backend at admit-time.
     pub estimated_reserved_tokens: u64,
-    /// Per-program `chars / actual_prefill_tokens` ratio (M3). `None` until
-    /// first UsageEvent arrives. Falls back to `RouterState.global_*` then
-    /// to `NEUTRAL_RATIO`.
+    /// Per-program `chars / actual_prefill_tokens` ratio (M3).
     pub local_char_to_token_ratio: Option<f64>,
     /// Per-program `actual_completion_tokens / declared_max_tokens` (M3).
-    /// `None` until first event with declared_max_tokens > 0 arrives.
     pub local_completion_fraction: Option<f64>,
     /// Last calibration timestamp (M3 wall-time decay).
     pub last_calibration_at: Option<Instant>,
+    /// Lifecycle state (M4). Default Idle.
+    pub status: ProgramStatus,
+    /// Pause-deferral flag (M4). Set when scheduler wants to pause an ACTING
+    /// program; pause completes when status transitions out of Acting.
+    pub marked_for_pause: bool,
+    /// When the program was last paused (M4 + M5 starvation mitigation).
+    pub paused_at: Option<Instant>,
 }
 
 impl Program {
@@ -160,6 +179,9 @@ impl Program {
             local_char_to_token_ratio: None,
             local_completion_fraction: None,
             last_calibration_at: None,
+            status: ProgramStatus::Idle,
+            marked_for_pause: false,
+            paused_at: None,
         }
     }
 }
@@ -251,8 +273,106 @@ impl RouterState {
         program.backend_url = Some(backend_url.to_string());
         program.in_flight = program.in_flight.saturating_add(1);
         program.step_count = program.step_count.saturating_add(1);
+        // M4: status transitions to Reasoning on admit. paused_at cleared.
+        program.status = ProgramStatus::Reasoning;
+        program.paused_at = None;
         let backend = self.backends.entry(backend_url.to_string()).or_default();
         backend.active_programs.insert(program_id.to_string());
+    }
+
+    /// M4: pick a victim program on `backend_url` to pause. Selects the
+    /// program with smallest `step_count` (least progress wasted). Excludes
+    /// already-Paused programs and those with `marked_for_pause` set.
+    fn pick_victim(&self, backend_url: &str) -> Option<String> {
+        self.programs
+            .iter()
+            .filter(|(_, p)| {
+                p.backend_url.as_deref() == Some(backend_url)
+                    && p.status != ProgramStatus::Paused
+                    && !p.marked_for_pause
+            })
+            .min_by_key(|(_, p)| p.step_count)
+            .map(|(pid, _)| pid.clone())
+    }
+
+    /// M4: transition `pid` to Paused on `backend_url`. If currently Acting
+    /// (mid-stream), defer by setting `marked_for_pause=true`; otherwise
+    /// immediately un-reserve and update status. Idempotent.
+    fn pause_until_safe(&mut self, pid: &str, backend_url: &str) {
+        let Some(p) = self.programs.get_mut(pid) else { return };
+        if p.status == ProgramStatus::Acting {
+            p.marked_for_pause = true;
+            return;
+        }
+        if p.status == ProgramStatus::Paused {
+            return; // already paused
+        }
+        let reserved = p.estimated_reserved_tokens;
+        p.status = ProgramStatus::Paused;
+        p.paused_at = Some(Instant::now());
+        p.estimated_reserved_tokens = 0;
+        p.backend_url = None;
+        if let Some(b) = self.backends.get_mut(backend_url) {
+            b.active_program_tokens = b.active_program_tokens.saturating_sub(reserved);
+            b.active_programs.remove(pid);
+        }
+        // Ensure waiting_event exists so wake can target it.
+        self.waiting_events
+            .entry(pid.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()));
+    }
+
+    /// M4: scheduler tick body. Iterates backends; for each over the
+    /// capacity threshold (after `capacity_reserved_fraction`), repeatedly
+    /// picks victims and pauses until under threshold.
+    fn proactive_pause_pass(&mut self, capacity_reserved_fraction: f64) {
+        let urls: Vec<String> = self.backends.keys().cloned().collect();
+        'outer: for url in urls {
+            'inner: loop {
+                let over = match self.backends.get(&url) {
+                    Some(b) if b.capacity_tokens > 0 => {
+                        let thr = (b.capacity_tokens as f64
+                            * (1.0 - capacity_reserved_fraction))
+                            as u64;
+                        b.active_program_tokens > thr
+                    }
+                    _ => break 'inner,
+                };
+                if !over {
+                    break 'inner;
+                }
+                let Some(victim) = self.pick_victim(&url) else {
+                    continue 'outer;
+                };
+                self.pause_until_safe(&victim, &url);
+            }
+        }
+    }
+
+    /// M4: check `marked_for_pause` flag and apply deferred pause when status
+    /// transitions out of Acting. Called from success paths of streaming
+    /// usage extraction + non-streaming response completion + Drop fallback
+    /// (call sites added in M5+M6 once Acting-state transitions wire up).
+    #[cfg_attr(not(test), expect(
+        dead_code,
+        reason = "M5/M6 wire the production call sites; tests cover the logic now"
+    ))]
+    pub(crate) fn check_marked_for_pause(&mut self, pid: &str) {
+        let (mark, url) = match self.programs.get(pid) {
+            Some(p) if p.marked_for_pause && p.status != ProgramStatus::Acting => {
+                (true, p.backend_url.clone())
+            }
+            _ => return,
+        };
+        if !mark {
+            return;
+        }
+        if let Some(p) = self.programs.get_mut(pid) {
+            p.marked_for_pause = false;
+        }
+        if let Some(u) = url {
+            self.pause_until_safe(pid, &u);
+        }
     }
 
     /// Get-or-create the per-program `Notify` that paused requests await on.
@@ -521,6 +641,34 @@ impl ThunderPolicy {
                 );
             }
             debug!("usage_consumer channel closed; task exiting");
+        });
+
+        // ----- scheduler tick task (M4 proactive pause; M5 BFD resume) -----
+        // Runs every `scheduler_tick_ms` (default 100ms). On each tick:
+        //   (a) proactive_pause_pass: pause victims on backends over capacity
+        //   (b) try_greedy_resume (M5): BFD resume of paused programs
+        // The tick can also be woken early via `capacity_freed_signal`
+        // (M6: usage_consumer / Drop fire it when capacity frees).
+        let tick_dur = Duration::from_millis(config.scheduler_tick_ms.max(10));
+        let reserved_fraction = config.capacity_reserved_fraction;
+        let state_for_scheduler = Arc::downgrade(&state);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fire-and-forget scheduler — exits when policy dropped via Weak::upgrade"
+        )]
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tick_dur);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let Some(state_arc) = state_for_scheduler.upgrade() else {
+                    debug!("ThunderPolicy state dropped; scheduler tick exiting");
+                    return;
+                };
+                let mut guard = state_arc.write().await;
+                guard.proactive_pause_pass(reserved_fraction);
+                // M5 BFD resume integration goes here.
+            }
         });
 
         // ----- progress_consumer task (M2 incremental streaming tokens) -----
@@ -1542,6 +1690,221 @@ mod tests {
         );
     }
 
+    // ===== M4 proactive pause tests =====
+
+    #[test]
+    fn pick_victim_returns_lowest_step_count() {
+        let mut state = RouterState::default();
+        let url = "http://b1:8000".to_string();
+        for (pid, step) in [("a", 5), ("b", 2), ("c", 10)] {
+            state.programs.insert(
+                pid.to_string(),
+                Program {
+                    program_id: pid.to_string(),
+                    backend_url: Some(url.clone()),
+                    in_flight: 1,
+                    total_tokens: 0,
+                    step_count: step,
+                    estimated_reserved_tokens: 100,
+                    local_char_to_token_ratio: None,
+                    local_completion_fraction: None,
+                    last_calibration_at: None,
+                    status: ProgramStatus::Reasoning,
+                    marked_for_pause: false,
+                    paused_at: None,
+                },
+            );
+        }
+        assert_eq!(state.pick_victim(&url), Some("b".to_string()));
+    }
+
+    #[test]
+    fn pick_victim_excludes_paused_and_marked() {
+        let mut state = RouterState::default();
+        let url = "http://b1:8000".to_string();
+        for (pid, step, st, mark) in [
+            ("a", 5, ProgramStatus::Reasoning, false),
+            ("b", 2, ProgramStatus::Paused, false),         // paused → excluded
+            ("c", 1, ProgramStatus::Reasoning, true),        // marked → excluded
+            ("d", 3, ProgramStatus::Reasoning, false),
+        ] {
+            state.programs.insert(
+                pid.to_string(),
+                Program {
+                    program_id: pid.to_string(),
+                    backend_url: Some(url.clone()),
+                    in_flight: 1,
+                    total_tokens: 0,
+                    step_count: step,
+                    estimated_reserved_tokens: 100,
+                    local_char_to_token_ratio: None,
+                    local_completion_fraction: None,
+                    last_calibration_at: None,
+                    status: st,
+                    marked_for_pause: mark,
+                    paused_at: None,
+                },
+            );
+        }
+        // d (step=3) is the eligible candidate with lowest step_count
+        assert_eq!(state.pick_victim(&url), Some("d".to_string()));
+    }
+
+    #[test]
+    fn pause_until_safe_immediate_for_reasoning() {
+        let mut state = RouterState::default();
+        let url = "http://b1:8000".to_string();
+        state.backends.insert(
+            url.clone(),
+            BackendState {
+                active_programs: ["v".to_string()].into_iter().collect(),
+                active_program_tokens: 500,
+                capacity_tokens: 1000,
+            },
+        );
+        state.programs.insert(
+            "v".to_string(),
+            Program {
+                program_id: "v".to_string(),
+                backend_url: Some(url.clone()),
+                in_flight: 1,
+                total_tokens: 0,
+                step_count: 1,
+                estimated_reserved_tokens: 500,
+                local_char_to_token_ratio: None,
+                local_completion_fraction: None,
+                last_calibration_at: None,
+                status: ProgramStatus::Reasoning,
+                marked_for_pause: false,
+                paused_at: None,
+            },
+        );
+        state.pause_until_safe("v", &url);
+        let p = state.programs.get("v").unwrap();
+        assert_eq!(p.status, ProgramStatus::Paused);
+        assert_eq!(p.estimated_reserved_tokens, 0);
+        assert!(p.paused_at.is_some());
+        assert_eq!(p.backend_url, None);
+        let b = state.backends.get(&url).unwrap();
+        assert_eq!(b.active_program_tokens, 0);
+        assert!(!b.active_programs.contains("v"));
+    }
+
+    #[test]
+    fn pause_until_safe_defers_acting() {
+        let mut state = RouterState::default();
+        let url = "http://b1:8000".to_string();
+        state.backends.insert(
+            url.clone(),
+            BackendState {
+                active_programs: ["a".to_string()].into_iter().collect(),
+                active_program_tokens: 500,
+                capacity_tokens: 1000,
+            },
+        );
+        state.programs.insert(
+            "a".to_string(),
+            Program {
+                program_id: "a".to_string(),
+                backend_url: Some(url.clone()),
+                in_flight: 1,
+                total_tokens: 0,
+                step_count: 1,
+                estimated_reserved_tokens: 500,
+                local_char_to_token_ratio: None,
+                local_completion_fraction: None,
+                last_calibration_at: None,
+                status: ProgramStatus::Acting,
+                marked_for_pause: false,
+                paused_at: None,
+            },
+        );
+        state.pause_until_safe("a", &url);
+        let p = state.programs.get("a").unwrap();
+        assert_eq!(p.status, ProgramStatus::Acting, "still Acting (deferred)");
+        assert!(p.marked_for_pause, "marked for pause");
+        assert_eq!(p.estimated_reserved_tokens, 500, "still reserved");
+        let b = state.backends.get(&url).unwrap();
+        assert_eq!(b.active_program_tokens, 500, "still booked");
+    }
+
+    #[test]
+    fn proactive_pause_pass_evicts_until_under_threshold() {
+        let mut state = RouterState::default();
+        let url = "http://b1:8000".to_string();
+        state.backends.insert(
+            url.clone(),
+            BackendState {
+                active_programs: ["a", "b", "c"].into_iter().map(String::from).collect(),
+                active_program_tokens: 950,
+                capacity_tokens: 1000, // threshold @ 0.10 reserved = 900; active=950 > 900 → pause needed
+            },
+        );
+        for (pid, step) in [("a", 5), ("b", 2), ("c", 10)] {
+            state.programs.insert(
+                pid.to_string(),
+                Program {
+                    program_id: pid.to_string(),
+                    backend_url: Some(url.clone()),
+                    in_flight: 1,
+                    total_tokens: 0,
+                    step_count: step,
+                    estimated_reserved_tokens: 320,
+                    local_char_to_token_ratio: None,
+                    local_completion_fraction: None,
+                    last_calibration_at: None,
+                    status: ProgramStatus::Reasoning,
+                    marked_for_pause: false,
+                    paused_at: None,
+                },
+            );
+        }
+        // active=950 > threshold=900 → pause victims until ≤ 900
+        state.proactive_pause_pass(0.10);
+        let b = state.backends.get(&url).unwrap();
+        assert!(
+            b.active_program_tokens <= 900,
+            "post-pause should be ≤ threshold; got {}",
+            b.active_program_tokens
+        );
+        // b (lowest step) should have been paused first
+        assert_eq!(state.programs.get("b").unwrap().status, ProgramStatus::Paused);
+    }
+
+    #[test]
+    fn check_marked_for_pause_takes_deferred_pause_when_no_longer_acting() {
+        let mut state = RouterState::default();
+        let url = "http://b1:8000".to_string();
+        state.backends.insert(
+            url.clone(),
+            BackendState {
+                active_programs: ["m".to_string()].into_iter().collect(),
+                active_program_tokens: 500,
+                capacity_tokens: 1000,
+            },
+        );
+        state.programs.insert(
+            "m".to_string(),
+            Program {
+                program_id: "m".to_string(),
+                backend_url: Some(url.clone()),
+                in_flight: 0,
+                total_tokens: 0,
+                step_count: 1,
+                estimated_reserved_tokens: 500,
+                local_char_to_token_ratio: None,
+                local_completion_fraction: None,
+                last_calibration_at: None,
+                status: ProgramStatus::Idle, // no longer Acting
+                marked_for_pause: true,
+                paused_at: None,
+            },
+        );
+        state.check_marked_for_pause("m");
+        assert_eq!(state.programs.get("m").unwrap().status, ProgramStatus::Paused);
+        assert!(!state.programs.get("m").unwrap().marked_for_pause);
+    }
+
     // ===== M3 calibration tests =====
 
     #[test]
@@ -1797,6 +2160,9 @@ mod tests {
                 local_char_to_token_ratio: None,
                 local_completion_fraction: None,
                 last_calibration_at: None,
+                status: ProgramStatus::Idle,
+                marked_for_pause: false,
+                paused_at: None,
             });
         }
 
@@ -1842,6 +2208,9 @@ mod tests {
                 local_char_to_token_ratio: None,
                 local_completion_fraction: None,
                 last_calibration_at: None,
+                status: ProgramStatus::Idle,
+                marked_for_pause: false,
+                paused_at: None,
             });
         }
 
@@ -1901,6 +2270,9 @@ mod tests {
                 local_char_to_token_ratio: None,
                 local_completion_fraction: None,
                 last_calibration_at: None,
+                status: ProgramStatus::Idle,
+                marked_for_pause: false,
+                paused_at: None,
             });
         }
         {
