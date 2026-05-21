@@ -162,18 +162,31 @@ participate in ThunderAgent state when streaming.
 
 In parallel, a 100ms scheduler tick runs:
 
-- **Proactive pause**: any backend over `1 - capacity_reserved_fraction` of its
-  capacity gets one of its lowest-progress programs paused and unbooked.
-- **BFD greedy resume**: paused programs are placed back onto backends using a
-  **Best-Fit Decreasing** bin-packing heuristic — the classic approximation
-  algorithm for the bin-packing problem. Concretely: paused programs are
-  sorted by their estimated KV-cache footprint (largest first; programs paused
-  longer than 15 minutes get a priority boost so they are not starved), and
-  each program is then placed on the backend with the **smallest remaining
-  capacity that still fits it**. Putting big programs first onto tight-fit
-  backends keeps free capacity contiguous on the rest of the fleet, which
-  leaves room for the next batch of incoming traffic. A program that does
-  not fit on any backend stays paused and is retried on the next tick.
+- **Proactive pause** (paper Eq 9: `S_pause(P) = 1/c_P + 𝕀(τ = Acting)`): any
+  backend over `1 - capacity_reserved_fraction` of its capacity gets its
+  best-scoring victim paused and unbooked. Acting programs (idle between LLM
+  calls, KV currently unused) are strictly preferred; within a tier the
+  shortest-context program wins because re-prefilling it later is cheapest
+  (recomputation cost scales with `c²`).
+- **Shortest-first global resume** (paper Eq 8:
+  `S_restore(P) = 1/c_P + 𝕀(τ = Reasoning)`): paused programs are partitioned
+  into three tiers and resumed in order:
+    1. **Reasoning** — has a client request currently blocked on it
+       (`pending_requests > 0`) and a history of prior turns. Resuming
+       unblocks real work.
+    2. **New** — admitted once but never completed a turn (`step_count == 1`).
+       Prevents first-time programs from starving.
+    3. **Acting** — paused while idle between LLM calls with no client request
+       waiting.
+
+  Within each tier, programs sort ascending by context length (shortest first
+  per `1/c_P`). Programs paused longer than 15 minutes get a starvation boost
+  ahead of the tier ordering so no program waits forever. Each selected
+  program is then placed on the backend with the **most remaining capacity
+  that fits it** — first-fit on largest-remaining, which is load-balancing
+  across DP replicas (paper §8: once paused, a program's KV is assumed
+  evicted, so resume placement is node-agnostic). A program that doesn't fit
+  on any backend stays paused and is retried on the next tick.
 
 ---
 
@@ -203,9 +216,10 @@ Key log lines to watch in production:
 - `thunder TR pause (full)` — backend over capacity threshold; a paused program
   was unbooked. Frequent occurrences = raise `--thunder-capacity-reserved-fraction`
   or scale workers.
-- `thunder TR resume (BFD)` — paused program was resumed onto a backend with
-  capacity. Long gaps between pause and resume = check backend KV-cache
-  recovery or lower `--thunder-capacity-poll-interval-secs`.
+- `thunder resume` — paused program was resumed onto a backend with capacity.
+  Log fields include `tier` (0=Reasoning, 1=New, 2=Acting). Long gaps between
+  pause and resume = check backend KV-cache recovery or lower
+  `--thunder-capacity-poll-interval-secs`.
 - `thunder force resume (timeout)` — a paused program exceeded
   `--thunder-resume-timeout-secs` and was admitted regardless of capacity. If
   you see these in normal operation, your capacity numbers are too tight.

@@ -223,6 +223,10 @@ impl GenerationRequest for CompletionRequest {
             StringOrArray::Array(v) => v.join(" "),
         }
     }
+
+    fn declared_max_tokens_hint(&self) -> Option<u32> {
+        self.max_tokens
+    }
 }
 
 // ============================================================================

@@ -173,6 +173,10 @@ impl GenerationRequest for CreateMessageRequest {
     fn program_id_hint(&self) -> Option<&str> {
         self.metadata.as_ref()?.program_id.as_deref()
     }
+
+    fn declared_max_tokens_hint(&self) -> Option<u32> {
+        Some(self.max_tokens)
+    }
 }
 
 impl Tool {

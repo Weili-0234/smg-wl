@@ -64,6 +64,7 @@ pub(crate) struct ThunderStreamingCtx {
     pub program_id: String,
     pub backend_url: String,
     pub request_text_chars: usize,
+    pub declared_max_tokens: Option<u32>,
     pub protocol: SseProtocol,
     pub guard: ProgramRequestGuard,
     pub usage_tx: UnboundedSender<UsageEvent>,
@@ -164,6 +165,7 @@ impl Router {
         text: Option<&str>,
         headers: Option<&HeaderMap>,
         program_id: Option<&str>,
+        declared_max_tokens: Option<u32>,
     ) -> Option<Arc<dyn Worker>> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
@@ -203,7 +205,7 @@ impl Router {
                     headers,
                     hash_ring,
                     program_id,
-                    declared_max_tokens: None,
+                    declared_max_tokens,
                     avoid_backend: None,
                 },
             )
@@ -327,6 +329,7 @@ impl Router {
                 Some(text),
                 headers,
                 program_id_owned.as_deref(),
+                typed_req.declared_max_tokens_hint(),
             )
             .await
         {
@@ -399,6 +402,7 @@ impl Router {
                         .unwrap_or_else(|| "default".to_string()),
                     backend_url: worker.url().to_string(),
                     request_text_chars: text.len(),
+                    declared_max_tokens: typed_req.declared_max_tokens_hint(),
                     protocol: sse::detect_protocol(route),
                     guard,
                     usage_tx,
@@ -477,7 +481,7 @@ impl Router {
                                     total_tokens,
                                     request_text_chars: text.len(),
                                     cache_read_input_tokens: None,
-                                        declared_max_tokens: None,
+                                    declared_max_tokens: typed_req.declared_max_tokens_hint(),
                                 });
                                 // Happy path: usage_consumer will handle
                                 // in_flight decrement. Suppress the guard's
@@ -1120,6 +1124,7 @@ impl Router {
                     program_id,
                     backend_url,
                     request_text_chars,
+                    declared_max_tokens,
                     protocol,
                     mut guard,
                     usage_tx,
@@ -1171,7 +1176,7 @@ impl Router {
                                         total_tokens,
                                         request_text_chars,
                                         cache_read_input_tokens: cache_read,
-                                        declared_max_tokens: None,
+                                        declared_max_tokens,
                                     });
                                     guard.complete();
                                     if tokens_since_last_progress > 0 {
@@ -1206,7 +1211,7 @@ impl Router {
                             total_tokens,
                             request_text_chars,
                             cache_read_input_tokens: cache_read,
-                                        declared_max_tokens: None,
+                            declared_max_tokens,
                         });
                         guard.complete();
                     }

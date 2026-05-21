@@ -54,6 +54,14 @@ pub trait GenerationRequest: Send + Sync {
     fn program_id_hint(&self) -> Option<&str> {
         None
     }
+
+    /// Optional client-declared maximum completion/output token budget.
+    /// Thunder uses this to estimate a request's KV footprint before usage
+    /// accounting is available. Request types that do not expose a generation
+    /// budget keep the default.
+    fn declared_max_tokens_hint(&self) -> Option<u32> {
+        None
+    }
 }
 
 // ============================================================================

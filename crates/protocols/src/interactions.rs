@@ -144,6 +144,12 @@ impl GenerationRequest for InteractionsRequest {
                 .join(" "),
         }
     }
+
+    fn declared_max_tokens_hint(&self) -> Option<u32> {
+        self.generation_config
+            .as_ref()
+            .and_then(|config| config.max_output_tokens)
+    }
 }
 
 // ============================================================================

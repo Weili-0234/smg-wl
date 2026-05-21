@@ -19,7 +19,7 @@
 use std::{
     collections::HashMap,
     f64,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -125,15 +125,20 @@ impl Default for ThunderConfig {
     }
 }
 
-/// Lifecycle state of a Program in Thunder's algorithm (M4 — Python parity).
+/// Lifecycle state of a Program in Thunder's algorithm.
+///
+/// Mirrors the paper's `τ ∈ {Reasoning, Acting}` phases plus the engineering
+/// states needed by the implementation (`Idle` for never-admitted programs,
+/// `Paused` for off-GPU programs in the global waiting queue).
 ///
 /// State transitions:
-/// - Idle → Reasoning: request admitted (select_worker returns)
-/// - Reasoning → Acting: first byte of upstream response received
-/// - Acting → Idle: stream end / non-stream response complete
-/// - Acting (with marked_for_pause) → Paused: deferred pause taken at stream end
-/// - Reasoning/Idle → Paused: scheduler picks as victim immediately
-/// - Paused → Reasoning: BFD greedy_resume picks for wake (M5)
+/// - Idle → Reasoning: request admitted (`assign()`)
+/// - Reasoning → Acting: request completes and the agent is between LLM calls
+///   (`usage_consumer_task` or `ProgramRequestGuard::Drop`, when `in_flight == 0`)
+/// - Reasoning (with `marked_for_pause`) → Paused: deferred pause taken when
+///   in-flight work drains
+/// - Acting/Idle → Paused: scheduler picks as victim immediately
+/// - Paused → Reasoning: scheduler picks for wake (`wake_program_to`)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ProgramStatus {
     #[default]
@@ -151,8 +156,21 @@ pub struct Program {
     pub backend_url: Option<String>,
     /// Count of in-flight requests for this program (admission tracking).
     pub in_flight: u32,
-    /// Cumulative tokens reported via UsageEvent (populated in P4+).
+    /// Count of requests currently waiting in `pick_tr` for capacity to free
+    /// (i.e. blocked on the per-program `Notify`). Used by `try_greedy_resume`
+    /// to tier paused programs as "Reasoning" (has a pending request) vs
+    /// "Acting" (idle between LLM calls), matching paper Eq 8.
+    pub pending_requests: u32,
+    /// Latest known context footprint for this program. On UsageEvent this is
+    /// REPLACED with `event.total_tokens` (not added) — the paper's `c_P` is
+    /// the program's current context length, not cumulative history.
     pub total_tokens: u64,
+    /// Tokens from this program currently included in
+    /// `backend.active_program_tokens` as retained KV footprint. Excludes
+    /// transient admission reservations (those live in
+    /// `estimated_reserved_tokens`). Unbooked on pause and replaced on each
+    /// UsageEvent so the backend total never double-counts a program.
+    pub accounted_tokens: u64,
     /// Step counter — increments per admission.
     pub step_count: u32,
     /// Tokens this program has *reserved* on its backend at admit-time.
@@ -178,7 +196,9 @@ impl Program {
             program_id,
             backend_url: None,
             in_flight: 0,
+            pending_requests: 0,
             total_tokens: 0,
+            accounted_tokens: 0,
             step_count: 0,
             estimated_reserved_tokens: 0,
             local_char_to_token_ratio: None,
@@ -285,9 +305,20 @@ impl RouterState {
         backend.active_programs.insert(program_id.to_string());
     }
 
-    /// M4: pick a victim program on `backend_url` to pause. Selects the
-    /// program with smallest `step_count` (least progress wasted). Excludes
-    /// already-Paused programs and those with `marked_for_pause` set.
+    /// Effective context length used for paper Eq 8/9 scoring. Takes the max
+    /// of the program's known footprints so the sort key is monotonic against
+    /// the largest reservation the scheduler has committed to.
+    fn context_tokens_for_scoring(p: &Program) -> u64 {
+        p.total_tokens
+            .max(p.accounted_tokens)
+            .max(p.estimated_reserved_tokens)
+            .max(1)
+    }
+
+    /// Pick a victim program on `backend_url` to pause. Implements paper Eq 9:
+    /// `S_pause(P) = 1/c_P + 𝕀(τ = Acting)` — Acting programs strictly first
+    /// (their retained KV is idle while a tool runs), then shortest context.
+    /// Excludes already-Paused programs and those with `marked_for_pause` set.
     fn pick_victim(&self, backend_url: &str) -> Option<String> {
         self.programs
             .iter()
@@ -296,22 +327,29 @@ impl RouterState {
                     && p.status != ProgramStatus::Paused
                     && !p.marked_for_pause
             })
-            .min_by_key(|(_, p)| p.step_count)
+            .min_by_key(|(pid, p)| {
+                (
+                    p.status != ProgramStatus::Acting,
+                    Self::context_tokens_for_scoring(p),
+                    (*pid).clone(),
+                )
+            })
             .map(|(pid, _)| pid.clone())
     }
 
-    /// M4: transition `pid` to Paused on `backend_url`. If currently Acting
-    /// (mid-stream), defer by setting `marked_for_pause=true`; otherwise
-    /// immediately un-reserve and update status. Idempotent.
+    /// Transition `pid` to Paused on `backend_url`. If the program still has
+    /// in-flight LLM work, defer by setting `marked_for_pause=true` (taken
+    /// when `in_flight` reaches 0 via `check_marked_for_pause`). Acting
+    /// programs are off-GPU between LLM calls and can be paused immediately.
+    /// Idempotent.
     fn pause_until_safe(&mut self, pid: &str, backend_url: &str) {
-        let Some(p) = self.programs.get_mut(pid) else { return };
-        // M4 + concurrency safety: any program with in-flight requests cannot
-        // be cleanly preempted. The bytes are already streaming back to the
-        // client; clearing the reservation now would mis-account capacity.
-        // Defer pause via marked_for_pause (taken when in_flight reaches 0
-        // via check_marked_for_pause from usage_consumer / Drop).
-        // This subsumes the Acting-state check (Acting always implies in_flight>0).
-        if p.status == ProgramStatus::Acting || p.in_flight > 0 {
+        let Some(p) = self.programs.get_mut(pid) else {
+            return;
+        };
+        // Reasoning programs with in-flight requests cannot be cleanly
+        // preempted. Acting programs have in_flight == 0 by construction so
+        // they pass straight through to the immediate-pause path.
+        if p.in_flight > 0 {
             p.marked_for_pause = true;
             return;
         }
@@ -319,59 +357,100 @@ impl RouterState {
             return; // already paused
         }
         let reserved = p.estimated_reserved_tokens;
+        let accounted = p.accounted_tokens;
+        // Snapshot whether the program had a pending request at pause time —
+        // used by `try_greedy_resume` to put it in the Reasoning tier per
+        // paper Eq 8. (Also dynamically observed at resume time, but recording
+        // the phase intent is informative for debug.)
+        let was_acting = p.status == ProgramStatus::Acting;
         p.status = ProgramStatus::Paused;
         p.paused_at = Some(Instant::now());
         p.estimated_reserved_tokens = 0;
+        p.accounted_tokens = 0;
         p.backend_url = None;
         if let Some(b) = self.backends.get_mut(backend_url) {
-            b.active_program_tokens = b.active_program_tokens.saturating_sub(reserved);
+            b.active_program_tokens = b
+                .active_program_tokens
+                .saturating_sub(reserved.saturating_add(accounted));
             b.active_programs.remove(pid);
         }
         // Ensure waiting_event exists so wake can target it.
         self.waiting_events
             .entry(pid.to_string())
             .or_insert_with(|| Arc::new(Notify::new()));
+        trace!(
+            program_id = %pid,
+            backend = %backend_url,
+            from_acting = was_acting,
+            reserved_unbooked = reserved,
+            accounted_unbooked = accounted,
+            "thunder pause"
+        );
     }
 
-    /// M5: BFD greedy_resume. Sort PAUSED programs DESC by total_tokens
-    /// (Python BFD step a), iterate. For each program, find the backend
-    /// with the most remaining capacity that fits the program's estimated
-    /// resume tokens (BFD step c). Wake via targeted `notify_one()` (M6).
-    /// Programs that don't fit anywhere stay PAUSED for next tick.
+    /// Shortest-first greedy resume with paper-Eq-8 three-tier priority:
     ///
-    /// Starvation mitigation: programs paused longer than
-    /// `PAUSED_PRIORITY_BOOST_AFTER` get sorted ahead of larger programs.
+    ///   Tier 1 (Reasoning): `pending_requests > 0 && step_count > 1`
+    ///                       — has a client request blocked on the per-program
+    ///                       Notify; resuming unblocks real work.
+    ///   Tier 2 (New):       `step_count == 1`
+    ///                       — admitted once but never completed a turn;
+    ///                       prioritized so first-time programs don't starve.
+    ///   Tier 3 (Acting):    everything else
+    ///                       — paused while idle between LLM calls.
+    ///
+    /// Within each tier, programs sort ASC by `context_tokens_for_scoring`
+    /// (`1/c_P` from paper Eq 8). Starvation mitigation boosts programs
+    /// paused longer than `PAUSED_PRIORITY_BOOST_AFTER` to the front
+    /// (cross-tier) so no program waits forever.
+    ///
+    /// Backend placement is BFD across DP replicas: paused programs go to the
+    /// backend with the most remaining capacity that fits them (paper §8 —
+    /// once paused, a program's KV is assumed evicted, so resume placement is
+    /// node-agnostic and serves load balancing).
+    ///
+    /// Programs that don't fit anywhere stay Paused for next tick.
     fn try_greedy_resume(&mut self) {
         let now = Instant::now();
-        let mut paused: Vec<(String, u64, Option<Instant>)> = self
+        // (pid, tier, est, starvation_boost)
+        // tier: 0 = Reasoning, 1 = New, 2 = Acting
+        let mut paused: Vec<(String, u8, u64, bool)> = self
             .programs
             .iter()
             .filter(|(_, p)| p.status == ProgramStatus::Paused)
             .map(|(pid, p)| {
-                // Use known total_tokens (program's history); floor at 100 for
-                // freshly-paused programs that haven't completed any request.
-                let est = p.total_tokens.max(100);
-                (pid.clone(), est, p.paused_at)
+                let tier: u8 = if p.pending_requests > 0 && p.step_count > 1 {
+                    0 // Reasoning: client request waiting
+                } else if p.step_count <= 1 {
+                    1 // New: fresh program, no completed turn yet
+                } else {
+                    2 // Acting: idle between LLM calls
+                };
+                let est = Self::context_tokens_for_scoring(p);
+                let starved = p
+                    .paused_at
+                    .map(|t| now.saturating_duration_since(t) > PAUSED_PRIORITY_BOOST_AFTER)
+                    .unwrap_or(false);
+                (pid.clone(), tier, est, starved)
             })
             .collect();
 
-        paused.sort_by(|(_, a_est, a_paused), (_, b_est, b_paused)| {
-            let a_priority = a_paused
-                .map(|t| now.saturating_duration_since(t) > PAUSED_PRIORITY_BOOST_AFTER)
-                .unwrap_or(false);
-            let b_priority = b_paused
-                .map(|t| now.saturating_duration_since(t) > PAUSED_PRIORITY_BOOST_AFTER)
-                .unwrap_or(false);
-            match (a_priority, b_priority) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => b_est.cmp(a_est),
-            }
+        // Sort key: starvation-boosted first, then by tier (R < New < A),
+        // then by context length ASC (shortest first per paper Eq 8),
+        // then by pid for determinism.
+        paused.sort_by(|a, b| {
+            let (a_pid, a_tier, a_est, a_starved) = a;
+            let (b_pid, b_tier, b_est, b_starved) = b;
+            b_starved
+                .cmp(a_starved)
+                .then_with(|| a_tier.cmp(b_tier))
+                .then_with(|| a_est.cmp(b_est))
+                .then_with(|| a_pid.cmp(b_pid))
         });
 
         let urls: Vec<String> = self.backends.keys().cloned().collect();
 
-        for (pid, est, _) in paused {
+        for (pid, tier, est, _) in paused {
             // Re-fetch sorted backends per iteration since assignments
             // mutate remaining capacity.
             let mut by_remaining: Vec<(String, u64)> = urls
@@ -390,6 +469,13 @@ impl RouterState {
             for (url, remaining) in &by_remaining {
                 if *remaining >= est {
                     self.wake_program_to(&pid, url, est);
+                    debug!(
+                        program_id = %pid,
+                        backend = %url,
+                        tier = tier,
+                        est = est,
+                        "thunder resume"
+                    );
                     break;
                 }
             }
@@ -441,15 +527,13 @@ impl RouterState {
         }
     }
 
-    /// M4: check `marked_for_pause` flag and apply deferred pause when the
+    /// Check `marked_for_pause` flag and apply deferred pause when the
     /// program is no longer in-flight. Called from `usage_consumer_task`
     /// (success path) and `ProgramRequestGuard::Drop` (error/disconnect
-    /// path) — both points where in_flight may have just reached 0.
+    /// path) — both points where `in_flight` may have just reached 0.
     pub(crate) fn check_marked_for_pause(&mut self, pid: &str) {
         let (mark, url) = match self.programs.get(pid) {
-            Some(p) if p.marked_for_pause && p.status != ProgramStatus::Acting => {
-                (true, p.backend_url.clone())
-            }
+            Some(p) if p.marked_for_pause && p.in_flight == 0 => (true, p.backend_url.clone()),
             _ => return,
         };
         if !mark {
@@ -611,27 +695,29 @@ impl ThunderPolicy {
                     .clone()
                     .unwrap_or_else(|| "default".to_string());
 
-                // Snapshot the per-program reservation BEFORE mutating state.
+                // Snapshot per-program accounting BEFORE mutating state.
                 // TR sub-mode (P5+) reserves `estimated_reserved_tokens` on
                 // the chosen backend at admit time so concurrent arrivals
                 // see the load. On UsageEvent we un-reserve that estimate
-                // and add the actual usage instead — net delta on the
-                // backend = `total_tokens - reserved`.
-                //
-                // Default sub-mode never sets `estimated_reserved_tokens`,
-                // so this collapses to the old "+ total_tokens" path.
+                // AND unbook the program's prior retained KV footprint, then
+                // replace both with the latest response's `total_tokens`.
+                // Paper's `c_P` is the program's current context length —
+                // NOT cumulative history — so per-request totals must replace
+                // the previously-accounted value, not add to it.
                 let mut guard = state_arc.write().await;
-                let reserved = guard
+                let (reserved, previous_accounted) = guard
                     .programs
                     .get(&pid)
-                    .map(|p| p.estimated_reserved_tokens)
-                    .unwrap_or(0);
+                    .map(|p| (p.estimated_reserved_tokens, p.accounted_tokens))
+                    .unwrap_or((0, 0));
+                let event_total_tokens = u64::from(event.total_tokens);
 
                 if let Some(b) = guard.backends.get_mut(&event.backend_url) {
-                    b.active_program_tokens = b.active_program_tokens.saturating_sub(reserved);
                     b.active_program_tokens = b
                         .active_program_tokens
-                        .saturating_add(u64::from(event.total_tokens));
+                        .saturating_sub(reserved.saturating_add(previous_accounted));
+                    b.active_program_tokens =
+                        b.active_program_tokens.saturating_add(event_total_tokens);
                 }
                 let now = Instant::now();
                 // M3 calibration update: chars/token ratio (per-program + global)
@@ -653,10 +739,19 @@ impl ThunderPolicy {
                 };
 
                 if let Some(p) = guard.programs.get_mut(&pid) {
-                    p.total_tokens = p.total_tokens.saturating_add(u64::from(event.total_tokens));
+                    // REPLACE, not add — `total_tokens` is the current context
+                    // length, not cumulative history.
+                    p.total_tokens = event_total_tokens;
+                    p.accounted_tokens = event_total_tokens;
                     p.estimated_reserved_tokens = 0;
                     if p.in_flight > 0 {
                         p.in_flight -= 1;
+                    }
+                    // Paper τ-transition: response complete + no other LLM
+                    // call in flight ⇒ program is now in Acting phase (agent
+                    // is between LLM calls, tool exec / orchestration time).
+                    if p.in_flight == 0 && p.status == ProgramStatus::Reasoning {
+                        p.status = ProgramStatus::Acting;
                     }
                     if let Some(observed) = observed_ratio {
                         update_calibration_with_decay(
@@ -728,6 +823,7 @@ impl ThunderPolicy {
                     backend = %event.backend_url,
                     total_tokens = event.total_tokens,
                     reserved_unwound = reserved,
+                    previous_accounted_unwound = previous_accounted,
                     waiters_woken = waiting.len(),
                     "usage applied"
                 );
@@ -857,7 +953,7 @@ impl ThunderPolicy {
 /// and the task exits.
 #[derive(Debug)]
 pub struct ProgramRequestGuard {
-    state: std::sync::Weak<RwLock<RouterState>>,
+    state: Weak<RwLock<RouterState>>,
     program_id: String,
     completed: bool,
 }
@@ -922,8 +1018,15 @@ impl Drop for ProgramRequestGuard {
                 if p.in_flight > 0 {
                     p.in_flight -= 1;
                 }
+                // Paper τ-transition: disconnect / error also drains in-flight;
+                // if the program was Reasoning and now has no LLM call running,
+                // it's in Acting (between LLM calls). The scheduler treats
+                // this as an eligible pause candidate per paper Eq 9.
+                if p.in_flight == 0 && p.status == ProgramStatus::Reasoning {
+                    p.status = ProgramStatus::Acting;
+                }
             }
-            // M4: take any deferred pause if the disconnect just brought
+            // Take any deferred pause if the disconnect just brought
             // in_flight to 0 while marked_for_pause is set.
             guard.check_marked_for_pause(&pid);
             // A slot may have freed — broadcast so paused programs re-check.
@@ -938,6 +1041,74 @@ impl Drop for ProgramRequestGuard {
                 reserved_unwound = reserved,
                 "ProgramRequestGuard drop fallback (no usage)"
             );
+        });
+    }
+}
+
+/// RAII guard for the per-program `pending_requests` counter.
+///
+/// `pick_tr` increments `pending_requests` when a request fails its first
+/// admission attempt and parks on the per-program `Notify`. The Reasoning
+/// tier in `try_greedy_resume` keys off `pending_requests > 0` to know a
+/// client is waiting on a paused program, so the counter must stay balanced
+/// across every exit path — including future cancellation.
+///
+/// Explicit success / timeout paths call `consume(&mut state)` under the
+/// already-held write lock for a synchronous decrement. If the future is
+/// dropped mid-await (upstream HTTP timeout, runtime shutdown, parent
+/// cancellation), `Drop` fires a fire-and-forget async decrement task,
+/// mirroring [`ProgramRequestGuard::Drop`]. Without this guard, cancelled
+/// `pick_tr` futures leak the counter and `try_greedy_resume` eventually
+/// misclassifies idle programs as Reasoning-tier candidates.
+pub(crate) struct PendingRequestGuard {
+    state: Weak<RwLock<RouterState>>,
+    program_id: String,
+    armed: bool,
+}
+
+impl PendingRequestGuard {
+    pub(crate) fn new(state: Weak<RwLock<RouterState>>, program_id: String) -> Self {
+        Self {
+            state,
+            program_id,
+            armed: true,
+        }
+    }
+
+    /// Consume the guard synchronously while the caller still holds the
+    /// write lock. Disarms `Drop`, then decrements `pending_requests`.
+    /// Saturates at zero so concurrent races (e.g. a stale prior `Drop` that
+    /// already ran) cannot underflow.
+    pub(crate) fn consume(mut self, state: &mut RouterState) {
+        self.armed = false;
+        if let Some(p) = state.programs.get_mut(&self.program_id) {
+            if p.pending_requests > 0 {
+                p.pending_requests -= 1;
+            }
+        }
+    }
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(state) = self.state.upgrade() else {
+            return; // policy already dropped — nothing to clean up
+        };
+        let pid = std::mem::take(&mut self.program_id);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "fire-and-forget cleanup task — exits when policy dropped via Weak::upgrade returning None"
+        )]
+        tokio::spawn(async move {
+            let mut guard = state.write().await;
+            if let Some(p) = guard.programs.get_mut(&pid) {
+                if p.pending_requests > 0 {
+                    p.pending_requests -= 1;
+                }
+            }
         });
     }
 }
@@ -1095,6 +1266,15 @@ impl ThunderPolicy {
         let timeout_dur = Duration::from_secs(self.config.resume_timeout_secs);
         let deadline = Instant::now() + timeout_dur;
 
+        // RAII guard for the `pending_requests` counter on `Program`. The
+        // Reasoning tier in `try_greedy_resume` reads `pending_requests > 0`
+        // to identify paused programs with a client request waiting. Every
+        // exit path of `pick_tr` must decrement the counter, including future
+        // cancellation — handled here by `PendingRequestGuard::Drop` firing
+        // an async decrement. Sync success/timeout paths use `consume()` for
+        // a synchronous decrement under the already-held write lock.
+        let mut pending_guard: Option<PendingRequestGuard> = None;
+
         loop {
             // ---- Step 1: acquire lock and try to admit ----
             // M3: `estimated_tokens` re-computed each iteration since calibration
@@ -1121,12 +1301,15 @@ impl ThunderPolicy {
                     .or_else(|| state.select_least_active(&urls));
 
                 let Some(chosen_url) = chosen_url else {
+                    if let Some(g) = pending_guard.take() {
+                        g.consume(&mut state);
+                    }
                     return None; // no backends in registry
                 };
 
-                // M5: detect BFD-pre-reserved program (wake_program_to already
-                // booked the backend on our behalf). Skip the duplicate reservation
-                // but still bump in_flight/step_count via assign().
+                // M5: detect scheduler-pre-reserved program (wake_program_to
+                // already booked the backend on our behalf). Skip the duplicate
+                // reservation but still bump in_flight/step_count via assign().
                 let already_reserved = state
                     .programs
                     .get(&program_id)
@@ -1143,7 +1326,12 @@ impl ThunderPolicy {
                         self.config.capacity_reserved_fraction,
                     )
                 {
-                    let idx = workers.iter().position(|w| w.url() == chosen_url)?;
+                    let Some(idx) = workers.iter().position(|w| w.url() == chosen_url) else {
+                        if let Some(g) = pending_guard.take() {
+                            g.consume(&mut state);
+                        }
+                        return None;
+                    };
                     state.assign(&program_id, &chosen_url);
                     if !already_reserved {
                         if let Some(b) = state.backends.get_mut(&chosen_url) {
@@ -1151,26 +1339,57 @@ impl ThunderPolicy {
                                 b.active_program_tokens.saturating_add(estimated_tokens);
                         }
                         if let Some(p) = state.programs.get_mut(&program_id) {
-                            p.estimated_reserved_tokens = p
-                                .estimated_reserved_tokens
-                                .saturating_add(estimated_tokens);
+                            p.estimated_reserved_tokens =
+                                p.estimated_reserved_tokens.saturating_add(estimated_tokens);
                         }
+                    }
+                    if let Some(g) = pending_guard.take() {
+                        g.consume(&mut state);
                     }
                     debug!(
                         program_id = %program_id,
                         backend = %chosen_url,
                         est = estimated_tokens,
-                        bfd_resumed = already_reserved,
+                        scheduler_resumed = already_reserved,
                         "thunder TR admit"
                     );
                     return Some(idx);
                 }
 
-                // Block: register a Notify for this program. Note the
-                // `notified()` future MUST be created AFTER the next pause
-                // checkpoint — registering it inside the locked region here
-                // is wrong (it would be dropped on drop(state)). We return
-                // the Arc<Notify> and create the future just below.
+                // Block: register a Notify for this program and mark the
+                // program as having a pending request (Reasoning-tier signal
+                // for resume). Note the `notified()` future MUST be created
+                // AFTER the next pause checkpoint — registering it inside the
+                // locked region here is wrong (it would be dropped on
+                // drop(state)). We return the Arc<Notify> and create the
+                // future just below.
+                if pending_guard.is_none() {
+                    let now = Instant::now();
+                    let p = state
+                        .programs
+                        .entry(program_id.clone())
+                        .or_insert_with(|| Program::new(program_id.clone()));
+                    p.pending_requests = p.pending_requests.saturating_add(1);
+                    // Brand-new programs (`status == Idle`, never admitted)
+                    // need an explicit `Paused` status so that
+                    // `try_greedy_resume`'s iteration filter sees them and
+                    // applies the 3-tier scoring (paper Eq 8). Without this,
+                    // first-admission failures would wake only via the
+                    // capacity-free broadcast, with no priority among
+                    // concurrent newcomers. We deliberately do NOT flip
+                    // Reasoning (in-flight) or Acting (idle-with-accounting)
+                    // programs to Paused here — those still own backend
+                    // capacity and must go through the scheduler's
+                    // pause_until_safe path for correct unbookkeeping.
+                    if p.status == ProgramStatus::Idle {
+                        p.status = ProgramStatus::Paused;
+                        p.paused_at = Some(now);
+                    }
+                    pending_guard = Some(PendingRequestGuard::new(
+                        Arc::downgrade(&self.state),
+                        program_id.clone(),
+                    ));
+                }
                 let n = state.waiting_event_for(&program_id);
                 debug!(
                     program_id = %program_id,
@@ -1191,6 +1410,10 @@ impl ThunderPolicy {
                     program_id = %program_id,
                     "thunder TR force-resume on timeout (deadline already passed)"
                 );
+                if let Some(g) = pending_guard.take() {
+                    let mut state = self.state.write().await;
+                    g.consume(&mut state);
+                }
                 return self
                     .force_admit_after_timeout(workers, &program_id, estimated_tokens)
                     .await;
@@ -1204,6 +1427,10 @@ impl ThunderPolicy {
                     program_id = %program_id,
                     "thunder TR force-resume on timeout"
                 );
+                if let Some(g) = pending_guard.take() {
+                    let mut state = self.state.write().await;
+                    g.consume(&mut state);
+                }
                 return self
                     .force_admit_after_timeout(workers, &program_id, estimated_tokens)
                     .await;
@@ -1428,7 +1655,10 @@ mod tests {
             .programs
             .get("usage-test")
             .expect("program must exist after route");
-        assert_eq!(prog.total_tokens, 80, "usage event must add to total_tokens");
+        assert_eq!(
+            prog.total_tokens, 80,
+            "usage event must record current total_tokens (REPLACE)"
+        );
         assert_eq!(prog.in_flight, 0, "consumer must decrement in_flight on event");
 
         let backend = state
@@ -1437,7 +1667,37 @@ mod tests {
             .expect("backend state must exist");
         assert_eq!(
             backend.active_program_tokens, 80,
-            "backend active_program_tokens must accumulate"
+            "backend active_program_tokens must track current footprint"
+        );
+
+        // Send a second UsageEvent on the same program; the backend total
+        // must REPLACE the prior accounted footprint, not double-count it.
+        tx.send(UsageEvent {
+            program_id: Some("usage-test".to_string()),
+            backend_url: workers[0].url().to_string(),
+            prompt_tokens: 90,
+            completion_tokens: 30,
+            total_tokens: 120,
+            request_text_chars: 260,
+            cache_read_input_tokens: None,
+            declared_max_tokens: None,
+        })
+        .expect("send must succeed (consumer alive)");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let state = policy.snapshot_state().await;
+        let prog = state
+            .programs
+            .get("usage-test")
+            .expect("program must exist after second usage");
+        assert_eq!(prog.total_tokens, 120);
+        let backend = state
+            .backends
+            .get(workers[0].url())
+            .expect("backend state must exist");
+        assert_eq!(
+            backend.active_program_tokens, 120,
+            "backend footprint must replace prior context, not accumulate per-turn totals"
         );
     }
 
@@ -1594,7 +1854,7 @@ mod tests {
             prog.estimated_reserved_tokens, 0,
             "reservation must be cleared"
         );
-        assert_eq!(prog.total_tokens, 100, "actual total must accumulate");
+        assert_eq!(prog.total_tokens, 100, "actual total must be recorded");
         let backend = post.backends.get(workers[0].url()).expect("backend");
         assert_eq!(
             backend.active_program_tokens, 100,
@@ -1617,7 +1877,10 @@ mod tests {
             Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
         ));
         let workers = mock_workers(1);
-        // Seed capacity = 100 and pre-fill 100 used → no headroom.
+        // Saturate against the polled capacity. `StubMetrics::fetch_capacity`
+        // returns 10_000, and the poll task's first immediate tick will
+        // overwrite anything we set here, so we must use 10_000 — both the
+        // pre-poll seed AND the polled value reach the same saturated state.
         {
             let mut g = policy.state.write().await;
             g.refresh_backends(&[workers[0].url().to_string()]);
@@ -1625,8 +1888,8 @@ mod tests {
                 .backends
                 .get_mut(workers[0].url())
                 .expect("seeded above");
-            b.capacity_tokens = 100;
-            b.active_program_tokens = 100; // saturated
+            b.capacity_tokens = 10_000;
+            b.active_program_tokens = 10_000; // saturated against polled capacity
             // Pre-create the program so usage_consumer's `programs.get_mut`
             // path is exercised against an existing entry.
             g.programs.insert(
@@ -1783,13 +2046,13 @@ mod tests {
             Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
         );
         let workers = mock_workers(1);
-        // Saturate the backend permanently.
+        // Saturate against polled capacity (StubMetrics returns 10_000).
         {
             let mut g = policy.state.write().await;
             g.refresh_backends(&[workers[0].url().to_string()]);
             let b = g.backends.get_mut(workers[0].url()).expect("seeded");
-            b.capacity_tokens = 100;
-            b.active_program_tokens = 100;
+            b.capacity_tokens = 10_000;
+            b.active_program_tokens = 10_000;
         }
         let info = SelectWorkerInfo {
             program_id: Some("force-prog"),
@@ -1810,12 +2073,179 @@ mod tests {
         );
     }
 
-    // ===== M5+M6 BFD greedy_resume + targeted notify tests =====
+    /// Gap 1 regression: a brand-new program that hits capacity on its FIRST
+    /// admission attempt must enter the Paused set with `pending_requests > 0`
+    /// so `try_greedy_resume`'s 3-tier sort can prioritize it (tier 1: New).
+    /// Without this, first-admission failures wake only via the broadcast
+    /// `notify_waiters` on capacity-free, with no priority among concurrent
+    /// newcomers.
+    #[tokio::test]
+    async fn tr_mode_blocked_new_program_is_in_paused_set() {
+        let policy = Arc::new(ThunderPolicy::with_metrics_client(
+            ThunderConfig {
+                sub_mode: ThunderSubMode::Tr,
+                resume_timeout_secs: 60,
+                scheduler_tick_ms: 10_000, // long tick so this test owns timing
+                ..Default::default()
+            },
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        ));
+        let workers = mock_workers(1);
 
-    /// CRITICAL Python-parity test: a program paused on backend X must be
+        // Saturate against polled capacity (StubMetrics returns 10_000); the
+        // poll task's first immediate tick overwrites anything lower.
+        {
+            let mut g = policy.state.write().await;
+            g.refresh_backends(&[workers[0].url().to_string()]);
+            let b = g.backends.get_mut(workers[0].url()).expect("seeded");
+            b.capacity_tokens = 10_000;
+            b.active_program_tokens = 10_000;
+        }
+
+        // Spawn pick_tr for a brand-new program; it must block.
+        let p_clone = policy.clone();
+        let w_clone = workers.clone();
+        let task = tokio::spawn(async move {
+            p_clone
+                .select_worker_async(
+                    &w_clone,
+                    &SelectWorkerInfo {
+                        program_id: Some("newcomer"),
+                        request_text: Some("hi"),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        // Wait for pick_tr to reach the block path.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        {
+            let snap = policy.snapshot_state().await;
+            let p = snap
+                .programs
+                .get("newcomer")
+                .expect("newcomer must be registered after blocking");
+            assert_eq!(
+                p.status,
+                ProgramStatus::Paused,
+                "blocked new program must be in Paused set for 3-tier resume"
+            );
+            assert_eq!(
+                p.pending_requests, 1,
+                "block path must increment pending_requests"
+            );
+            assert!(
+                p.paused_at.is_some(),
+                "paused_at must be set for starvation accounting"
+            );
+            assert_eq!(
+                p.step_count, 0,
+                "never admitted → step_count stays 0 → tier 1 (New) eligible"
+            );
+        }
+
+        // Free capacity and trigger try_greedy_resume manually (scheduler
+        // tick is set to 10s so we drive it ourselves for determinism).
+        {
+            let mut g = policy.state.write().await;
+            let b = g.backends.get_mut(workers[0].url()).expect("seeded");
+            b.active_program_tokens = 0; // freed
+            g.try_greedy_resume();
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("pick_tr must complete within 2s")
+            .expect("task must not panic")
+            .expect("admit must succeed");
+        assert_eq!(result, 0);
+
+        // After admit, the guard's consume() must have decremented.
+        let snap = policy.snapshot_state().await;
+        let p = snap.programs.get("newcomer").unwrap();
+        assert_eq!(
+            p.pending_requests, 0,
+            "PendingRequestGuard::consume() must decrement on admit"
+        );
+        assert_eq!(p.status, ProgramStatus::Reasoning);
+        assert_eq!(p.step_count, 1, "step_count bumped by assign()");
+    }
+
+    /// Gap 2 regression: if `pick_tr`'s future is cancelled mid-await (e.g.
+    /// upstream HTTP timeout, runtime cancellation), `PendingRequestGuard::Drop`
+    /// must fire an async decrement so `pending_requests` doesn't leak.
+    /// Without this guard, long-lived services accumulate phantom Reasoning-
+    /// tier candidates on programs whose clients no longer exist, crowding
+    /// out real waiters at resume time.
+    #[tokio::test]
+    async fn tr_mode_cancellation_releases_pending_request_counter() {
+        let policy = Arc::new(ThunderPolicy::with_metrics_client(
+            ThunderConfig {
+                sub_mode: ThunderSubMode::Tr,
+                resume_timeout_secs: 60,
+                scheduler_tick_ms: 10_000,
+                ..Default::default()
+            },
+            Arc::new(StubMetrics) as Arc<dyn thunder_metrics::MetricsClient>,
+        ));
+        let workers = mock_workers(1);
+
+        // Saturate against polled capacity (StubMetrics returns 10_000).
+        {
+            let mut g = policy.state.write().await;
+            g.refresh_backends(&[workers[0].url().to_string()]);
+            let b = g.backends.get_mut(workers[0].url()).expect("seeded");
+            b.capacity_tokens = 10_000;
+            b.active_program_tokens = 10_000;
+        }
+
+        let p_clone = policy.clone();
+        let w_clone = workers.clone();
+        let task = tokio::spawn(async move {
+            p_clone
+                .select_worker_async(
+                    &w_clone,
+                    &SelectWorkerInfo {
+                        program_id: Some("cancel-test"),
+                        request_text: Some("hi"),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let snap = policy.snapshot_state().await;
+            let p = snap.programs.get("cancel-test").unwrap();
+            assert_eq!(p.pending_requests, 1, "counter incremented at block");
+        }
+
+        // Cancel the awaiting future. The local guard inside pick_tr is
+        // dropped, which spawns an async decrement task.
+        task.abort();
+
+        // Yield generously so the spawned decrement task can acquire the
+        // write lock and run.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let snap = policy.snapshot_state().await;
+        let p = snap.programs.get("cancel-test").unwrap();
+        assert_eq!(
+            p.pending_requests, 0,
+            "PendingRequestGuard::Drop must release the counter on cancellation"
+        );
+    }
+
+    // ===== M5+M6 shortest-first resume + targeted notify tests =====
+
+    /// CRITICAL paper-parity test: a program paused on backend X must be
     /// allowed to resume on backend Y if Y has the most remaining capacity.
-    /// This validates that BFD greedy_resume relocates programs across
-    /// backends, not just resumes them on the same backend.
+    /// This validates that global resume relocates programs across backends,
+    /// not just resumes them on the same backend (paper §8 — once paused, a
+    /// program's KV is assumed evicted, so resume placement is node-agnostic).
     #[test]
     fn paused_program_resumes_on_different_backend_with_capacity() {
         let mut state = RouterState::default();
@@ -1843,7 +2273,7 @@ mod tests {
         // cleared on pause; this is the post-pause state).
         let mut p = Program::new("relocate-me".to_string());
         p.status = ProgramStatus::Paused;
-        p.total_tokens = 200; // BFD will use 200 as resume estimate
+        p.total_tokens = 200; // resume estimate
         p.paused_at = Some(Instant::now());
         p.backend_url = None;
         state.programs.insert("relocate-me".to_string(), p);
@@ -1851,8 +2281,8 @@ mod tests {
             .waiting_events
             .insert("relocate-me".to_string(), Arc::new(Notify::new()));
 
-        // BFD greedy_resume should pick Y (1000 free) over X (50 free)
-        // because est=200 doesn't fit in X but fits in Y.
+        // Resume should pick Y (1000 free) over X (50 free) because est=200
+        // doesn't fit in X but fits in Y.
         state.try_greedy_resume();
 
         let resumed = state.programs.get("relocate-me").unwrap();
@@ -1884,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn bfd_assigns_largest_program_to_most_remaining_backend() {
+    fn resume_assigns_shortest_program_first() {
         let mut state = RouterState::default();
         state.backends.insert(
             "A".to_string(),
@@ -1899,7 +2329,7 @@ mod tests {
             BackendState {
                 active_programs: Default::default(),
                 active_program_tokens: 0,
-                capacity_tokens: 100,
+                capacity_tokens: 40,
             },
         );
         for (pid, total) in [("p_big", 150), ("p_small", 50)] {
@@ -1913,20 +2343,19 @@ mod tests {
                 .insert(pid.to_string(), Arc::new(Notify::new()));
         }
         state.try_greedy_resume();
-        // p_big (150) → A (cap 200, fits) ; p_small (50) → A (200-150=50, fits) or B (100, fits)
-        // BFD picks A first (most remaining); after assigning p_big, A has 50 free.
-        // For p_small (50): re-sort backends → B has 100 free vs A has 50 → both fit;
-        // pick B (DESC sort).
+        // Paper Eq 8 restore scoring is shortest-first. p_small (50) resumes
+        // before p_big (150); B has too little capacity for either, so both
+        // land on A.
         let p_big = state.programs.get("p_big").unwrap();
         let p_small = state.programs.get("p_small").unwrap();
+        assert_eq!(p_small.status, ProgramStatus::Reasoning);
+        assert_eq!(p_small.backend_url.as_deref(), Some("A"));
         assert_eq!(p_big.status, ProgramStatus::Reasoning);
         assert_eq!(p_big.backend_url.as_deref(), Some("A"));
-        assert_eq!(p_small.status, ProgramStatus::Reasoning);
-        assert!(p_small.backend_url.is_some(), "p_small assigned somewhere");
     }
 
     #[test]
-    fn bfd_skips_program_that_doesnt_fit_anywhere() {
+    fn resume_skips_program_that_doesnt_fit_anywhere() {
         let mut state = RouterState::default();
         state.backends.insert(
             "A".to_string(),
@@ -1952,10 +2381,10 @@ mod tests {
     }
 
     #[test]
-    fn bfd_prioritizes_long_paused_program_for_starvation_mitigation() {
-        // Backend has room for exactly ONE of the two paused programs. p_new is
-        // larger (would normally win BFD ordering) but p_old has been paused
-        // long enough to get priority-boosted. p_old should resume first; p_new
+    fn resume_prioritizes_long_paused_program_for_starvation_mitigation() {
+        // Backend has room for exactly ONE of the two paused programs. Both
+        // are in the same tier; the starvation boost on p_old pulls it ahead
+        // of the shortest-first ordering. p_old should resume first; p_new
         // stays paused for next tick.
         let mut state = RouterState::default();
         state.backends.insert(
@@ -1996,6 +2425,123 @@ mod tests {
             state.programs.get("new").unwrap().status,
             ProgramStatus::Paused,
             "new stays paused — old got the slot via priority"
+        );
+    }
+
+    /// Paper Eq 8 / Python parity: at restore time, the scheduler ranks
+    /// paused programs by τ-tier first. Reasoning (pending request,
+    /// step_count > 1) beats New (step_count <= 1) beats Acting (idle
+    /// between LLM calls). Within tier, shortest context wins.
+    #[test]
+    fn resume_orders_by_reasoning_new_acting_tier() {
+        let mut state = RouterState::default();
+        // Backend has just enough capacity for ONE program at a time.
+        state.backends.insert(
+            "A".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 400,
+            },
+        );
+
+        // r_long: Reasoning tier — pending request + has history. Long context;
+        // sized to consume all backend capacity so the other tiers' candidates
+        // are forced to wait.
+        let mut r_long = Program::new("r_long".to_string());
+        r_long.status = ProgramStatus::Paused;
+        r_long.total_tokens = 400;
+        r_long.step_count = 5;
+        r_long.pending_requests = 1;
+        r_long.paused_at = Some(Instant::now());
+        state.programs.insert("r_long".to_string(), r_long);
+        state
+            .waiting_events
+            .insert("r_long".to_string(), Arc::new(Notify::new()));
+
+        // newcomer: New tier — step_count=1, no pending. Short context.
+        let mut newcomer = Program::new("newcomer".to_string());
+        newcomer.status = ProgramStatus::Paused;
+        newcomer.total_tokens = 50;
+        newcomer.step_count = 1;
+        newcomer.pending_requests = 0;
+        newcomer.paused_at = Some(Instant::now());
+        state.programs.insert("newcomer".to_string(), newcomer);
+        state
+            .waiting_events
+            .insert("newcomer".to_string(), Arc::new(Notify::new()));
+
+        // a_short: Acting tier — no pending, has history. Shortest context
+        // overall, but tier-3 → resumes last.
+        let mut a_short = Program::new("a_short".to_string());
+        a_short.status = ProgramStatus::Paused;
+        a_short.total_tokens = 10;
+        a_short.step_count = 5;
+        a_short.pending_requests = 0;
+        a_short.paused_at = Some(Instant::now());
+        state.programs.insert("a_short".to_string(), a_short);
+        state
+            .waiting_events
+            .insert("a_short".to_string(), Arc::new(Notify::new()));
+
+        state.try_greedy_resume();
+
+        // r_long takes the slot (Reasoning tier wins despite longer context).
+        // newcomer and a_short stay Paused — capacity exhausted after r_long.
+        assert_eq!(
+            state.programs.get("r_long").unwrap().status,
+            ProgramStatus::Reasoning,
+            "Reasoning tier (pending request) resumes first regardless of context length"
+        );
+        assert_eq!(
+            state.programs.get("newcomer").unwrap().status,
+            ProgramStatus::Paused,
+            "New tier waits"
+        );
+        assert_eq!(
+            state.programs.get("a_short").unwrap().status,
+            ProgramStatus::Paused,
+            "Acting tier (no pending) waits even when it has the shortest context"
+        );
+    }
+
+    /// Within the Reasoning tier, shortest context wins (paper Eq 8 `1/c_P`).
+    #[test]
+    fn resume_within_reasoning_tier_picks_shortest_context() {
+        let mut state = RouterState::default();
+        state.backends.insert(
+            "A".to_string(),
+            BackendState {
+                active_programs: Default::default(),
+                active_program_tokens: 0,
+                capacity_tokens: 100,
+            },
+        );
+
+        for (pid, tokens) in [("r_big", 80), ("r_small", 30)] {
+            let mut prog = Program::new(pid.to_string());
+            prog.status = ProgramStatus::Paused;
+            prog.total_tokens = tokens;
+            prog.step_count = 5;
+            prog.pending_requests = 1;
+            prog.paused_at = Some(Instant::now());
+            state.programs.insert(pid.to_string(), prog);
+            state
+                .waiting_events
+                .insert(pid.to_string(), Arc::new(Notify::new()));
+        }
+
+        state.try_greedy_resume();
+        // Only one fits at a time. r_small (30) wins on shortest-first.
+        assert_eq!(
+            state.programs.get("r_small").unwrap().status,
+            ProgramStatus::Reasoning,
+            "shortest in Reasoning tier resumes first"
+        );
+        // r_big (80) doesn't fit in remaining 70 → stays paused.
+        assert_eq!(
+            state.programs.get("r_big").unwrap().status,
+            ProgramStatus::Paused
         );
     }
 
@@ -2044,40 +2590,49 @@ mod tests {
     // ===== M4 proactive pause tests =====
 
     #[test]
-    fn pick_victim_returns_lowest_step_count() {
+    fn pick_victim_returns_shortest_context_with_acting_priority() {
+        // Paper Eq 9: S_pause = 1/c_P + 𝕀(τ = Acting).
+        // Acting first (idle KV), then shortest context.
         let mut state = RouterState::default();
         let url = "http://b1:8000".to_string();
-        for (pid, step) in [("a", 5), ("b", 2), ("c", 10)] {
+        for (pid, tokens, status) in [
+            ("a", 500, ProgramStatus::Reasoning),
+            ("b", 80, ProgramStatus::Reasoning),
+            ("c", 20, ProgramStatus::Acting),
+        ] {
             state.programs.insert(
                 pid.to_string(),
                 Program {
                     program_id: pid.to_string(),
                     backend_url: Some(url.clone()),
-                    in_flight: 1,
-                    total_tokens: 0,
-                    step_count: step,
-                    estimated_reserved_tokens: 100,
+                    in_flight: 0,
+                    pending_requests: 0,
+                    total_tokens: tokens,
+                    accounted_tokens: 0,
+                    step_count: 1,
+                    estimated_reserved_tokens: 0,
                     local_char_to_token_ratio: None,
                     local_completion_fraction: None,
                     last_calibration_at: None,
-                    status: ProgramStatus::Reasoning,
+                    status,
                     marked_for_pause: false,
                     paused_at: None,
                 },
             );
         }
-        assert_eq!(state.pick_victim(&url), Some("b".to_string()));
+        // c is Acting with shortest context — wins the score outright.
+        assert_eq!(state.pick_victim(&url), Some("c".to_string()));
     }
 
     #[test]
     fn pick_victim_excludes_paused_and_marked() {
         let mut state = RouterState::default();
         let url = "http://b1:8000".to_string();
-        for (pid, step, st, mark) in [
-            ("a", 5, ProgramStatus::Reasoning, false),
-            ("b", 2, ProgramStatus::Paused, false),         // paused → excluded
-            ("c", 1, ProgramStatus::Reasoning, true),        // marked → excluded
-            ("d", 3, ProgramStatus::Reasoning, false),
+        for (pid, tokens, st, mark) in [
+            ("a", 500, ProgramStatus::Reasoning, false),
+            ("b", 2, ProgramStatus::Paused, false),   // paused → excluded
+            ("c", 1, ProgramStatus::Reasoning, true), // marked → excluded
+            ("d", 30, ProgramStatus::Reasoning, false),
         ] {
             state.programs.insert(
                 pid.to_string(),
@@ -2085,9 +2640,11 @@ mod tests {
                     program_id: pid.to_string(),
                     backend_url: Some(url.clone()),
                     in_flight: 1,
-                    total_tokens: 0,
-                    step_count: step,
-                    estimated_reserved_tokens: 100,
+                    pending_requests: 0,
+                    total_tokens: tokens,
+                    accounted_tokens: 0,
+                    step_count: 1,
+                    estimated_reserved_tokens: 0,
                     local_char_to_token_ratio: None,
                     local_completion_fraction: None,
                     last_calibration_at: None,
@@ -2097,7 +2654,7 @@ mod tests {
                 },
             );
         }
-        // d (step=3) is the eligible candidate with lowest step_count
+        // d is the only Reasoning candidate not excluded; shortest context wins.
         assert_eq!(state.pick_victim(&url), Some("d".to_string()));
     }
 
@@ -2120,7 +2677,9 @@ mod tests {
                 program_id: "v".to_string(),
                 backend_url: Some(url.clone()),
                 in_flight: 0, // no request currently running
+                pending_requests: 0,
                 total_tokens: 0,
+                accounted_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
                 local_char_to_token_ratio: None,
@@ -2164,7 +2723,9 @@ mod tests {
                 program_id: "w".to_string(),
                 backend_url: Some(url.clone()),
                 in_flight: 1, // request actively running
+                pending_requests: 0,
                 total_tokens: 0,
+                accounted_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
                 local_char_to_token_ratio: None,
@@ -2195,7 +2756,10 @@ mod tests {
     }
 
     #[test]
-    fn pause_until_safe_defers_acting() {
+    fn pause_until_safe_pauses_off_gpu_acting_program() {
+        // Acting + in_flight=0: program is between LLM calls; its retained
+        // KV is idle. The scheduler can pause it immediately (paper Eq 9:
+        // Acting programs are the preferred pause victims).
         let mut state = RouterState::default();
         let url = "http://b1:8000".to_string();
         state.backends.insert(
@@ -2211,10 +2775,12 @@ mod tests {
             Program {
                 program_id: "a".to_string(),
                 backend_url: Some(url.clone()),
-                in_flight: 1,
-                total_tokens: 0,
+                in_flight: 0,
+                pending_requests: 0,
+                total_tokens: 500,
+                accounted_tokens: 500,
                 step_count: 1,
-                estimated_reserved_tokens: 500,
+                estimated_reserved_tokens: 0,
                 local_char_to_token_ratio: None,
                 local_completion_fraction: None,
                 last_calibration_at: None,
@@ -2225,11 +2791,13 @@ mod tests {
         );
         state.pause_until_safe("a", &url);
         let p = state.programs.get("a").unwrap();
-        assert_eq!(p.status, ProgramStatus::Acting, "still Acting (deferred)");
-        assert!(p.marked_for_pause, "marked for pause");
-        assert_eq!(p.estimated_reserved_tokens, 500, "still reserved");
+        assert_eq!(p.status, ProgramStatus::Paused);
+        assert_eq!(p.accounted_tokens, 0, "accounted unbooked on pause");
         let b = state.backends.get(&url).unwrap();
-        assert_eq!(b.active_program_tokens, 500, "still booked");
+        assert_eq!(
+            b.active_program_tokens, 0,
+            "backend footprint released on pause"
+        );
     }
 
     #[test]
@@ -2244,16 +2812,18 @@ mod tests {
                 capacity_tokens: 1000, // threshold @ 0.10 reserved = 900; active=950 > 900 → pause needed
             },
         );
-        for (pid, step) in [("a", 5), ("b", 2), ("c", 10)] {
+        for (pid, tokens) in [("a", 500), ("b", 40), ("c", 410)] {
             state.programs.insert(
                 pid.to_string(),
                 Program {
                     program_id: pid.to_string(),
                     backend_url: Some(url.clone()),
                     in_flight: 0, // idle programs (between requests) — eligible for immediate pause
-                    total_tokens: 0,
-                    step_count: step,
-                    estimated_reserved_tokens: 320,
+                    pending_requests: 0,
+                    total_tokens: tokens,
+                    accounted_tokens: 0,
+                    step_count: 1,
+                    estimated_reserved_tokens: tokens,
                     local_char_to_token_ratio: None,
                     local_completion_fraction: None,
                     last_calibration_at: None,
@@ -2271,8 +2841,11 @@ mod tests {
             "post-pause should be ≤ threshold; got {}",
             b.active_program_tokens
         );
-        // b (lowest step) should have been paused first
-        assert_eq!(state.programs.get("b").unwrap().status, ProgramStatus::Paused);
+        // b (shortest context = 40) should have been paused first.
+        assert_eq!(
+            state.programs.get("b").unwrap().status,
+            ProgramStatus::Paused
+        );
     }
 
     #[test]
@@ -2293,7 +2866,9 @@ mod tests {
                 program_id: "m".to_string(),
                 backend_url: Some(url.clone()),
                 in_flight: 0,
+                pending_requests: 0,
                 total_tokens: 0,
+                accounted_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
                 local_char_to_token_ratio: None,
@@ -2599,7 +3174,9 @@ mod tests {
                 program_id: "pid-leak".to_string(),
                 backend_url: Some(backend_url.clone()),
                 in_flight: 1,
+                pending_requests: 0,
                 total_tokens: 0,
+                accounted_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
                 local_char_to_token_ratio: None,
@@ -2647,7 +3224,9 @@ mod tests {
                 program_id: "pid-c".to_string(),
                 backend_url: Some(backend_url.clone()),
                 in_flight: 1,
+                pending_requests: 0,
                 total_tokens: 0,
+                accounted_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
                 local_char_to_token_ratio: None,
@@ -2709,7 +3288,9 @@ mod tests {
                 program_id: "pid-sat".to_string(),
                 backend_url: Some(backend_url.clone()),
                 in_flight: 1,
+                pending_requests: 0,
                 total_tokens: 0,
+                accounted_tokens: 0,
                 step_count: 1,
                 estimated_reserved_tokens: 500,
                 local_char_to_token_ratio: None,

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::common::GenerationRequest;
 use tracing::{error, warn};
 
 use super::PipelineStage;
@@ -83,8 +84,24 @@ impl PipelineStage for WorkerSelectionStage {
                     RequestType::Classify(req) => common_program_id::extract(req.as_ref()),
                     RequestType::Messages(req) => common_program_id::extract(req.as_ref()),
                 };
+                let declared_max_tokens = match &ctx.input.request_type {
+                    RequestType::Chat(req) => req.declared_max_tokens_hint(),
+                    RequestType::Generate(req) => req.declared_max_tokens_hint(),
+                    RequestType::Completion(req) => req.declared_max_tokens_hint(),
+                    RequestType::Responses(req) => req.declared_max_tokens_hint(),
+                    RequestType::Embedding(req) => req.declared_max_tokens_hint(),
+                    RequestType::Classify(req) => req.declared_max_tokens_hint(),
+                    RequestType::Messages(req) => req.declared_max_tokens_hint(),
+                };
                 match self
-                    .select_single_worker(model_id, text, tokens, headers, program_id)
+                    .select_single_worker(
+                        model_id,
+                        text,
+                        tokens,
+                        headers,
+                        program_id,
+                        declared_max_tokens,
+                    )
                     .await
                 {
                     Some(w) => WorkerSelection::Single { worker: w },
@@ -136,6 +153,7 @@ impl WorkerSelectionStage {
         tokens: Option<&[u32]>,
         headers: Option<&http::HeaderMap>,
         program_id: Option<&str>,
+        declared_max_tokens: Option<u32>,
     ) -> Option<Arc<dyn Worker>> {
         // Treat "unknown" model as wildcard (match any worker)
         let model_filter = if model_id == UNKNOWN_MODEL_ID {
@@ -177,8 +195,8 @@ impl WorkerSelectionStage {
                     headers,
                     hash_ring,
                     program_id,
-                    declared_max_tokens: None,
-            avoid_backend: None,
+                    declared_max_tokens,
+                    avoid_backend: None,
                 },
             )
             .await?;

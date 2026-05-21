@@ -231,6 +231,10 @@ impl GenerationRequest for GenerateRequest {
         // No text input found
         String::new()
     }
+
+    fn declared_max_tokens_hint(&self) -> Option<u32> {
+        self.sampling_params.as_ref().and_then(|p| p.max_new_tokens)
+    }
 }
 
 // ============================================================================

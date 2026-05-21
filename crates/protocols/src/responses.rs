@@ -3157,6 +3157,10 @@ impl GenerationRequest for ResponsesRequest {
             }
         }
     }
+
+    fn declared_max_tokens_hint(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
 }
 
 /// Validate the conversation reference's ID format.

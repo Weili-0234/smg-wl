@@ -653,6 +653,13 @@ impl GenerationRequest for ChatCompletionRequest {
 
         buffer
     }
+
+    fn declared_max_tokens_hint(&self) -> Option<u32> {
+        // Prefer the modern `max_completion_tokens`; fall back to the
+        // deprecated `max_tokens` for legacy clients that haven't migrated.
+        #[allow(deprecated)]
+        self.max_completion_tokens.or(self.max_tokens)
+    }
 }
 
 // ============================================================================
