@@ -62,7 +62,7 @@ pub async fn start_metrics_server(
 
     let listener = bind_metrics_listener(addr)
         .await
-        .unwrap_or_else(|msg| panic!("{msg}"));
+        .expect("metrics server bind failed");
 
     info!("Metrics server listening on {addr} (/metrics + /ws/metrics)");
 
